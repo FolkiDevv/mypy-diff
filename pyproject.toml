@@ -1,0 +1,76 @@
+[project]
+name = "mypy-diff"
+version = "0.1.0"
+description = "Diff mypy results between two revisions (Jujutsu or Git) and show only what changed"
+readme = "README.md"
+authors = [
+    { name = "FolkiDevv", email = "24841390+FolkiDevv@users.noreply.github.com" }
+]
+requires-python = ">=3.12"
+license = "MIT"
+keywords = ["mypy", "typing", "jujutsu", "jj", "git", "diff", "ci"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Quality Assurance",
+    "Typing :: Typed",
+]
+dependencies = [
+    "typer>=0.15",
+    "rich>=13.9",
+    "platformdirs>=4.3",
+]
+
+[project.scripts]
+mypy-diff-jj = "mypy_diff.cli:jj_main"
+mypy-diff-git = "mypy_diff.cli:git_main"
+
+[project.urls]
+Homepage = "https://github.com/FolkiDevv/mypy-diff"
+
+[build-system]
+requires = ["uv_build>=0.11.32,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "mypy>=1.13",
+    "ruff>=0.8",
+]
+
+[tool.mypy]
+strict = true
+files = ["src", "tests"]
+python_version = "3.12"
+pretty = true
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+disallow_untyped_defs = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = [
+    "E", "F", "W",   # pycodestyle / pyflakes
+    "I",             # isort
+    "UP",            # pyupgrade
+    "B",             # bugbear
+    "SIM",           # simplify
+    "RUF",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "jj: requires the jj executable",
+    "git: requires the git executable",
+]
