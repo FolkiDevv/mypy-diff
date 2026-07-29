@@ -32,7 +32,7 @@ Two commands, same behaviour, different version control:
 ## Install
 
 ```bash
-uv tool install mypy-diff
+uv tool install --from https://git@git.sourcecraft.dev/folkidevv/mypy-diff.git mypy-diff
 ```
 
 That installs **both** commands. From a checkout, use `uv tool install --from . mypy-diff`.
@@ -54,9 +54,6 @@ Check your setup at any time:
 ```bash
 mypy-diff-jj --doctor
 ```
-
-> **Windows:** after `winget install jj-vcs.jj`, restart your terminal so `PATH` picks up the
-> new executable.
 
 ## Usage
 
