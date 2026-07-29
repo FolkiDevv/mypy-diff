@@ -114,6 +114,7 @@ is always removed afterwards, even if the run fails.
       --cache-dir PATH   Where to keep cached results.
       --no-cache         Disable both caches for this run; leave nothing behind.
       --clean-cache      Delete the whole mypy-diff cache, then exit.
+      --no-progress      Do not show the progress indicator.
       --exit-zero        Always exit 0, even when new errors appear.
       --skip-version-check
       --doctor           Print detected tools and versions, then exit.
@@ -122,6 +123,22 @@ is always removed afterwards, even if the run fails.
 ```
 
 **Exit codes:** `0` no new errors · `1` new errors found · `2` mypy-diff itself failed.
+
+### Progress
+
+Two mypy runs take a while, so an interactive run shows which step it is on and how long it has
+been going:
+
+```
+⠹ [3/5] Running mypy on 4c37600f 0:00:12
+```
+
+It is indeterminate on purpose — mypy emits its whole report at the end of the build, so a filling
+bar would be fiction. The line erases itself when the run finishes.
+
+The indicator goes to **stderr** and only when stderr is a terminal, so `--format json > out.json`
+and pipes into `jq` stay clean. It is also off under `--verbose` (which already narrates each step)
+and under `--no-progress`.
 
 ### In CI
 

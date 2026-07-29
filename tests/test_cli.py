@@ -289,6 +289,31 @@ def test_clean_cache_works_outside_a_repository(
 # ------------------------------------------------------------------ failures
 
 
+def test_progress_never_reaches_machine_output(repo: Repo) -> None:
+    """The indicator lives on stderr so `--format json` can be piped safely.
+
+    CliRunner is not a terminal, so it is off here anyway; this pins the contract that stdout
+    stays parseable regardless.
+    """
+    repo.write("src/clean.py", BROKEN_SOURCE)
+
+    with_progress = invoke(repo, "--format", "json", "--", "src")
+    without_progress = invoke(repo, "--no-progress", "--format", "json", "--", "src")
+
+    left, right = json.loads(with_progress.output), json.loads(without_progress.output)
+    # Not the whole payload: jj re-snapshots the working copy on every invocation, so its
+    # commit_id legitimately differs between two runs. The diagnostics are the invariant.
+    for key in ("new", "fixed", "summary"):
+        assert left[key] == right[key]
+    assert with_progress.exit_code == without_progress.exit_code == EXIT_NEW_ERRORS
+
+
+def test_no_progress_flag_is_accepted(repo: Repo) -> None:
+    result = invoke(repo, "--no-progress", "--", "src")
+    assert result.exit_code == EXIT_OK
+    assert "No change in mypy errors." in result.output
+
+
 def test_no_targets_reports_an_actionable_error(repo: Repo) -> None:
     """A bare run in a project whose mypy config names no files.
 

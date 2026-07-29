@@ -23,12 +23,16 @@ from .matching import diff_messages
 from .models import DiffResult, MypyMessage, RevisionInfo
 from .mypy_exec import resolve_mypy, run_mypy
 from .preflight import ToolInfo, find_tool, require_vcs
+from .progress import Activity
 from .render import Only, OutputFormat, make_console, render
 from .vcs import GitBackend, JjBackend, VcsBackend
 
 EXIT_OK = 0
 EXIT_NEW_ERRORS = 1
 EXIT_FAILURE = 2
+
+#: Tools, revisions, base, target, compare — see `_run`.
+_TOTAL_STEPS = 5
 
 
 def build_app(backend_type: type[GitBackend] | type[JjBackend]) -> typer.Typer:
@@ -87,6 +91,10 @@ def build_app(backend_type: type[GitBackend] | type[JjBackend]) -> typer.Typer:
             bool,
             typer.Option("--clean-cache", help="Delete the whole mypy-diff cache, then exit."),
         ] = False,
+        no_progress: Annotated[
+            bool,
+            typer.Option("--no-progress", help="Do not show the progress indicator."),
+        ] = False,
         exit_zero: Annotated[
             bool, typer.Option("--exit-zero", help="Always exit 0, even when new errors appear.")
         ] = False,
@@ -120,6 +128,13 @@ def build_app(backend_type: type[GitBackend] | type[JjBackend]) -> typer.Typer:
             code = _run(
                 backend_type=backend_type,
                 console=console,
+                # The indicator shares the stderr console so rich draws messages above the live
+                # region, and never touches stdout, which may be piped JSON.
+                activity=Activity(
+                    errors,
+                    total=_TOTAL_STEPS,
+                    enabled=not verbose and not no_progress and errors.is_terminal,
+                ),
                 mypy_args=tuple(ctx.args),
                 base=base,
                 to=to,
@@ -156,6 +171,7 @@ def _run(
     *,
     backend_type: type[GitBackend] | type[JjBackend],
     console: Console,
+    activity: Activity,
     mypy_args: tuple[str, ...],
     base: str | None,
     to: str | None,
@@ -170,27 +186,34 @@ def _run(
     doctor: bool,
     verbose: bool,
 ) -> int:
-    vcs_tool = _resolve_vcs(backend_type.name, skip_version_check)
-    backend = backend_type(vcs_tool.command[0], verbose=verbose)
-    root = backend.root()
+    with activity:
+        activity.step("Checking tools")
+        vcs_tool = _resolve_vcs(backend_type.name, skip_version_check)
+        backend = backend_type(vcs_tool.command[0], verbose=verbose)
+        root = backend.root()
 
-    mypy, mypy_source = resolve_mypy(root, mypy_cmd)
+        mypy, mypy_source = resolve_mypy(root, mypy_cmd)
 
-    if doctor:
-        _print_doctor(console, backend_type.name, vcs_tool, mypy, mypy_source, root)
-        return EXIT_OK
+        if doctor:
+            _print_doctor(console, backend_type.name, vcs_tool, mypy, mypy_source, root)
+            return EXIT_OK
 
-    base_rev, target_rev = _resolve_revisions(backend, base, to, tip)
-    if verbose:
-        _print_verbose_header(console, backend, base_rev, target_rev, mypy, mypy_source)
+        activity.step("Resolving revisions")
+        base_rev, target_rev = _resolve_revisions(backend, base, to, tip)
+        if verbose:
+            _print_verbose_header(console, backend, base_rev, target_rev, mypy, mypy_source)
 
-    cache = ResultCache(cache_dir, enabled=not no_cache)
-    base_messages = _messages_for(backend, base_rev, mypy, mypy_args, cache, root, console, verbose)
-    target_messages = _messages_for(
-        backend, target_rev, mypy, mypy_args, cache, root, console, verbose
-    )
+        cache = ResultCache(cache_dir, enabled=not no_cache)
+        base_messages = _messages_for(
+            backend, base_rev, mypy, mypy_args, cache, root, console, verbose, activity
+        )
+        target_messages = _messages_for(
+            backend, target_rev, mypy, mypy_args, cache, root, console, verbose, activity
+        )
 
-    result = _diff(backend, base_rev, target_rev, base_messages, target_messages, root)
+        activity.step("Comparing results")
+        result = _diff(backend, base_rev, target_rev, base_messages, target_messages, root)
+
     render(result, console, output_format, only, show_unchanged)
 
     # Retention runs once the results are in hand, so a failed run never evicts anything.
@@ -251,8 +274,12 @@ def _messages_for(
     root: Path,
     console: Console,
     verbose: bool,
+    activity: Activity,
 ) -> tuple[MypyMessage, ...]:
     """Run mypy for one revision, using the cache when the revision is immutable."""
+    what = "working copy" if revision.is_working_copy else revision.short_id
+    activity.step(f"Checking {what}")
+
     cache_key: str | None = None
     if not revision.is_working_copy:
         cache_key = cache.key(revision.commit_id, mypy.display_version, mypy_args)
@@ -260,6 +287,7 @@ def _messages_for(
         if cached is not None:
             if verbose:
                 console.print(f"[dim]cache hit for {revision.short_id}[/dim]")
+            activity.detail(f"Checking {what} (cached)")
             return cached
 
     with ExitStack() as stack:
@@ -267,9 +295,12 @@ def _messages_for(
             # Run in place: it is faster and it is what the developer actually sees on disk.
             workdir = root
         else:
+            activity.detail(f"Checking out {what}")
             workdir = stack.enter_context(backend.worktree(revision))
             if verbose:
                 console.print(f"[dim]checked out {revision.short_id} into {workdir}[/dim]")
+
+        activity.detail(f"Running mypy on {what}")
 
         # The stack owns the mypy cache directory too: with --no-cache it is a temporary
         # directory that disappears with the worktree.
