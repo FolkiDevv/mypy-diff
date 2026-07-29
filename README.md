@@ -94,8 +94,9 @@ is always removed afterwards, even if the run fails.
       --only WHAT        new | fixed | all                         [all]
       --show-unchanged   List unchanged errors instead of counting them.
       --mypy-cmd TEXT    Command used to run mypy, e.g. 'uv run mypy'.
-      --cache-dir PATH   Where to keep cached base results.
-      --no-cache         Ignore and do not write the result cache.
+      --cache-dir PATH   Where to keep cached results.
+      --no-cache         Disable both caches for this run; leave nothing behind.
+      --clean-cache      Delete the whole mypy-diff cache, then exit.
       --exit-zero        Always exit 0, even when new errors appear.
       --skip-version-check
       --doctor           Print detected tools and versions, then exit.
@@ -147,10 +148,50 @@ gets its own incremental mypy cache — so the two runs never invalidate each ot
 
 ## Caching
 
-Results for the base revision are cached on disk, keyed by commit id, mypy version, mypy
-arguments and mypy config. A commit is immutable, so the entry stays valid forever and repeat
-runs skip the base analysis entirely. The dirty working copy is never cached. Because both
-backends key on a git SHA, `mypy-diff-jj` and `mypy-diff-git` share one cache.
+Two caches live side by side, in a per-user directory from
+[platformdirs](https://pypi.org/project/platformdirs/):
+
+| Platform | Location |
+|---|---|
+| Windows | `%LOCALAPPDATA%\mypy-diff\Cache` |
+| macOS | `~/Library/Caches/mypy-diff` |
+| Linux | `~/.cache/mypy-diff` |
+
+- **Result cache** — the diagnostics of one run, as `<hash>.json`. Keyed by commit id, mypy
+  version and mypy arguments. Written for any revision that resolves to a concrete commit; a
+  commit is immutable, so the entry stays valid forever and repeat runs skip that analysis
+  entirely. The dirty working copy is never cached. Tiny — a few hundred bytes per entry.
+- **Incremental mypy cache** — what mypy itself keeps, one directory per revision, handed over
+  with `--cache-dir`. This keeps the two runs from invalidating each other and leaves your own
+  `.mypy_cache` untouched. This is the part with real weight: **roughly 2 MB per revision.**
+
+Both backends key on a git SHA, so `mypy-diff-jj` and `mypy-diff-git` share one cache.
+
+### Retention
+
+By default the cache holds the **last 3 runs** and older entries are evicted automatically after
+each run (least-recently-used first). Since one run touches at most two revisions — the base and
+the target — that works out to at most 6 revision directories, or roughly 12 MB.
+
+Override it with an environment variable:
+
+```bash
+MYPY_DIFF_CACHE_KEEP=10   # keep the last 10 runs
+MYPY_DIFF_CACHE_KEEP=0    # keep everything, never evict
+```
+
+### Clearing it
+
+```bash
+mypy-diff-jj --clean-cache
+```
+
+Prints how much was freed and exits. It works from anywhere — no repository needed — and honours
+`--cache-dir`. Only files this tool created are removed, so pointing `--cache-dir` at a directory
+of your own will not wipe its other contents.
+
+`--no-cache` disables **both** caches for a single run: nothing is read, nothing is written, and
+mypy's incremental cache goes to a temporary directory that is deleted afterwards.
 
 ## Development
 

@@ -63,17 +63,37 @@ def resolve_mypy(root: Path, explicit: str | None = None) -> tuple[ToolInfo, str
     )
 
 
+def split_command(raw: str) -> tuple[str, ...]:
+    """Split a user-supplied command string into argv.
+
+    `shlex.split` defaults to POSIX rules, where a backslash is an escape character — that
+    silently destroys any Windows path (``C:\\tools\\mypy.exe`` becomes ``C:toolsmypy.exe``).
+    So a bare path to an existing file is taken verbatim, and anything else is split with the
+    backslash treated as an ordinary character on Windows.
+    """
+    stripped = raw.strip()
+    if not stripped:
+        return ()
+    unquoted = stripped.strip('"')
+    # An unquoted path that exists is unambiguous — never try to tokenize it.
+    if Path(unquoted).is_file():
+        return (unquoted,)
+    if os.name == "nt":
+        return tuple(token.strip('"') for token in shlex.split(stripped, posix=False))
+    return tuple(shlex.split(stripped))
+
+
 def _mypy_candidates(root: Path, explicit: str | None) -> list[tuple[tuple[str, ...], str]]:
     candidates: list[tuple[tuple[str, ...], str]] = []
 
     if explicit:
-        candidates.append((tuple(shlex.split(explicit)), "--mypy-cmd"))
+        candidates.append((split_command(explicit), "--mypy-cmd"))
         # An explicit command is a promise; do not silently fall back past it.
         return candidates
 
     from_env = os.environ.get("MYPY_DIFF_MYPY")
     if from_env:
-        candidates.append((tuple(shlex.split(from_env)), "$MYPY_DIFF_MYPY"))
+        candidates.append((split_command(from_env), "$MYPY_DIFF_MYPY"))
         return candidates
 
     active_venv = os.environ.get("VIRTUAL_ENV")
@@ -109,8 +129,12 @@ def run_mypy(
         argv,
         cwd=workdir,
         capture_output=True,
-        text=True,
         check=False,
+        # mypy's JSON output is UTF-8 (type names and messages can carry any character).
+        # Decoding with the locale codepage would break on non-ASCII identifiers.
+        text=True,
+        encoding="utf-8",
+        errors="replace",
         env={**os.environ, "MYPY_FORCE_COLOR": "0", "NO_COLOR": "1"},
     )
 

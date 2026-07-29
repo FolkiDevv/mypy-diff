@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import shutil
 import sys
+import tempfile
 from collections.abc import Callable
 from pathlib import Path
 
@@ -168,15 +169,39 @@ def test_comparing_a_revision_against_itself_is_empty(repo: Repo) -> None:
     assert "No change in mypy errors." in result.output
 
 
-def test_worktrees_are_not_left_behind(repo: Repo) -> None:
-    invoke(repo, "-b", "main", "--to", "main", "--", "src")
+def registered_worktrees(repo: Repo) -> str:
     if repo.vcs == "jj":
         assert JJ is not None
-        listed = run([JJ, "workspace", "list", "--ignore-working-copy"], cwd=repo.root).stdout
-    else:
-        assert GIT is not None
-        listed = run([GIT, "worktree", "list"], cwd=repo.root).stdout
-    assert "mypy-diff" not in listed
+        return run([JJ, "workspace", "list", "--ignore-working-copy"], cwd=repo.root).stdout
+    assert GIT is not None
+    return run([GIT, "worktree", "list"], cwd=repo.root).stdout
+
+
+def temp_worktrees() -> set[Path]:
+    """Scratch directories both backends create via mkdtemp(prefix="mypy-diff-")."""
+    return set(Path(tempfile.gettempdir()).glob("mypy-diff-*"))
+
+
+def test_worktrees_are_not_left_behind(repo: Repo) -> None:
+    before = temp_worktrees()
+    invoke(repo, "-b", "main", "--to", "main", "--", "src")
+
+    assert "mypy-diff" not in registered_worktrees(repo)
+    assert temp_worktrees() - before == set()
+
+
+def test_worktrees_are_cleaned_up_when_mypy_dies(repo: Repo) -> None:
+    """The failure path the happy-path test cannot reach.
+
+    A bogus mypy flag makes mypy exit 2, which raises out of the middle of the ExitStack that
+    owns the worktree — exactly where a leak would happen.
+    """
+    before = temp_worktrees()
+    result = invoke(repo, "-b", "main", "--to", "main", "--", "--not-a-real-mypy-flag", "src")
+
+    assert result.exit_code == EXIT_FAILURE
+    assert "mypy-diff" not in registered_worktrees(repo)
+    assert temp_worktrees() - before == set()
 
 
 # ------------------------------------------------------------------ cache
@@ -193,6 +218,72 @@ def test_base_results_are_cached_and_reused(repo: Repo, short_tmp_path: Path) ->
     second = invoke(repo, "-v", "--", "src", cache=cache)
     assert second.exit_code == EXIT_NEW_ERRORS
     assert "cache hit" in second.output
+
+
+def test_no_cache_leaves_nothing_behind(repo: Repo, isolated_cache: Path) -> None:
+    """--no-cache must disable mypy's incremental cache too, not just the result cache."""
+    repo.write("src/clean.py", BROKEN_SOURCE)
+
+    assert invoke(repo, "--", "src").exit_code == EXIT_NEW_ERRORS
+
+    leftovers = list(isolated_cache.rglob("*")) if isolated_cache.exists() else []
+    assert leftovers == [], f"--no-cache wrote to the cache directory: {leftovers}"
+
+
+def test_a_normal_run_keeps_mypy_caches_apart(repo: Repo, short_tmp_path: Path) -> None:
+    """Base and working copy must not share one incremental cache directory."""
+    cache = short_tmp_path / "cache"
+    invoke(repo, "--", "src", cache=cache)
+
+    directories = sorted(p.name for p in (cache / "mypy-cache").iterdir())
+    assert len(directories) == 2, directories
+    assert any(name.endswith("-wc") for name in directories)
+
+
+def test_retention_caps_the_incremental_cache(
+    repo: Repo, short_tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Keeping 1 run means at most 2 directories survive, however many revisions we check."""
+    monkeypatch.setenv("MYPY_DIFF_CACHE_KEEP", "1")
+    cache = short_tmp_path / "cache"
+
+    for index in range(3):
+        repo.write(f"src/extra{index}.py", f"value{index}: int = {index}\n")
+        invoke(repo, "--", "src", cache=cache)
+
+    assert len(list((cache / "mypy-cache").iterdir())) <= 2
+
+
+def test_clean_cache_empties_the_directory(repo: Repo, short_tmp_path: Path) -> None:
+    cache = short_tmp_path / "cache"
+    invoke(repo, "--", "src", cache=cache)
+    assert list(cache.rglob("*")), "expected the run to populate the cache"
+
+    app = build_app(JjBackend if repo.vcs == "jj" else GitBackend)
+    result = runner.invoke(
+        app, ["--cache-dir", str(cache), "--clean-cache"], catch_exceptions=False
+    )
+
+    assert result.exit_code == EXIT_OK
+    assert "Removed" in result.output
+    assert list(cache.glob("*.json")) == []
+    assert not (cache / "mypy-cache").exists()
+
+
+def test_clean_cache_works_outside_a_repository(
+    short_tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Clearing the cache must not require resolving a repository or finding mypy."""
+    outside = short_tmp_path / "elsewhere"
+    outside.mkdir()
+    monkeypatch.chdir(outside)
+
+    result = runner.invoke(
+        build_app(GitBackend),
+        ["--cache-dir", str(short_tmp_path / "cache"), "--clean-cache"],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == EXIT_OK
 
 
 # ------------------------------------------------------------------ failures
@@ -220,6 +311,25 @@ def test_running_outside_a_repository_fails_cleanly(
         result = runner.invoke(build_app(backend), ["--mypy-cmd", MYPY_CMD], catch_exceptions=False)
         assert result.exit_code == EXIT_FAILURE
         assert "Not a" in result.output
+
+
+def test_non_ascii_commit_messages_are_handled(repo: Repo) -> None:
+    """Regression: subprocess output must be decoded as UTF-8, not the locale codepage.
+
+    On Windows the default is cp1252, which raises UnicodeDecodeError inside subprocess's
+    reader thread — stdout silently comes back as None and revision resolution explodes.
+    """
+    if repo.vcs == "jj":
+        assert JJ is not None
+        run([JJ, "describe", "-r", "main", "-m", "фича: парсер — готово ✓"], cwd=repo.root)
+    else:
+        assert GIT is not None
+        run([GIT, "commit", "-q", "--amend", "-m", "фича: парсер — готово ✓"], cwd=repo.root)
+
+    result = invoke(repo, "-b", "main", "--", "src")
+
+    assert result.exit_code == EXIT_OK, result.output
+    assert "error:" not in result.output
 
 
 def test_version_flag(repo: Repo) -> None:

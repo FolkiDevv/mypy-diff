@@ -73,10 +73,18 @@ def build_app(backend_type: type[GitBackend] | type[JjBackend]) -> typer.Typer:
             typer.Option("--mypy-cmd", help="Command used to run mypy, e.g. 'uv run mypy'."),
         ] = None,
         cache_dir: Annotated[
-            Path | None, typer.Option("--cache-dir", help="Where to keep cached base results.")
+            Path | None, typer.Option("--cache-dir", help="Where to keep cached results.")
         ] = None,
         no_cache: Annotated[
-            bool, typer.Option("--no-cache", help="Ignore and do not write the result cache.")
+            bool,
+            typer.Option(
+                "--no-cache",
+                help="Disable both the result cache and mypy's incremental cache for this run.",
+            ),
+        ] = False,
+        clean_cache: Annotated[
+            bool,
+            typer.Option("--clean-cache", help="Delete the whole mypy-diff cache, then exit."),
         ] = False,
         exit_zero: Annotated[
             bool, typer.Option("--exit-zero", help="Always exit 0, even when new errors appear.")
@@ -99,6 +107,12 @@ def build_app(backend_type: type[GitBackend] | type[JjBackend]) -> typer.Typer:
 
         if version:
             console.print(f"mypy-diff {__version__}")
+            raise typer.Exit(EXIT_OK)
+
+        if clean_cache:
+            # Deliberately before any repository work: clearing the cache must work from
+            # anywhere, not just from inside a repository.
+            _clean_cache(console, cache_dir)
             raise typer.Exit(EXIT_OK)
 
         try:
@@ -176,11 +190,29 @@ def _run(
     result = _diff(backend, base_rev, target_rev, base_messages, target_messages, root)
     render(result, console, output_format, only, show_unchanged)
 
+    # Retention runs once the results are in hand, so a failed run never evicts anything.
+    cache.prune()
+
     if verbose:
         for note in backend.notes:
             console.print(f"[dim]note: {note}[/dim]")
 
     return EXIT_NEW_ERRORS if result.has_new else EXIT_OK
+
+
+def _clean_cache(console: Console, cache_dir: Path | None) -> None:
+    cache = ResultCache(cache_dir)
+    freed = cache.clear()
+    console.print(f"Removed {_human_size(freed)} from {cache.directory}")
+
+
+def _human_size(size: int) -> str:
+    value = float(size)
+    for unit in ("B", "KB", "MB", "GB"):
+        if value < 1024 or unit == "GB":
+            return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{value:.1f} GB"  # pragma: no cover - unreachable, loop returns at GB
 
 
 def _resolve_vcs(name: str, skip_version_check: bool) -> ToolInfo:
@@ -220,7 +252,7 @@ def _messages_for(
     """Run mypy for one revision, using the cache when the revision is immutable."""
     cache_key: str | None = None
     if not revision.is_working_copy:
-        cache_key = cache.key(revision.commit_id, mypy.display_version, mypy_args, root)
+        cache_key = cache.key(revision.commit_id, mypy.display_version, mypy_args)
         cached = cache.load(cache_key)
         if cached is not None:
             if verbose:
@@ -236,7 +268,9 @@ def _messages_for(
             if verbose:
                 console.print(f"[dim]checked out {revision.short_id} into {workdir}[/dim]")
 
-        run = run_mypy(mypy, workdir, mypy_args, cache.revision_mypy_cache(revision.commit_id))
+        # The stack owns the mypy cache directory too: with --no-cache it is a temporary
+        # directory that disappears with the worktree.
+        run = run_mypy(mypy, workdir, mypy_args, cache.mypy_cache_dir(revision, stack))
 
     if verbose and run.skipped_lines:
         console.print(f"[dim]skipped {run.skipped_lines} non-JSON line(s) from mypy[/dim]")

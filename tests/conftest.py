@@ -61,10 +61,25 @@ def run(argv: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
         argv,
         cwd=cwd,
         capture_output=True,
-        text=True,
         check=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
         env={**os.environ, "LC_ALL": "C", "NO_COLOR": "1"},
     )
+
+
+@pytest.fixture(autouse=True)
+def isolated_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Point the default cache directory at a temp dir, for every single test.
+
+    Without this the suite writes into the user's real `%LOCALAPPDATA%\\mypy-diff\\Cache`: each
+    fixture repo has fresh commit ids, so every run used to leave ~2 MB behind permanently.
+    Autouse so a test that forgets `--no-cache` still cannot escape.
+    """
+    directory = tmp_path / "mypy-diff-cache"
+    monkeypatch.setattr("mypy_diff.cache.default_cache_dir", lambda: directory)
+    return directory
 
 
 @pytest.fixture

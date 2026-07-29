@@ -88,9 +88,13 @@ def probe(name: str, command: tuple[str, ...]) -> ToolInfo | None:
         completed = subprocess.run(
             [*command, "--version"],
             capture_output=True,
-            text=True,
             check=False,
             timeout=60,
+            # Decode as UTF-8, not the locale codepage: a version banner with a non-ASCII
+            # byte must not crash the preflight check.
+            text=True,
+            encoding="utf-8",
+            errors="replace",
         )
     except (OSError, subprocess.SubprocessError):
         return None

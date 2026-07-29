@@ -1,6 +1,6 @@
 [project]
 name = "mypy-diff"
-version = "0.1.0"
+version = "0.1.1"
 description = "Diff mypy results between two revisions (Jujutsu or Git) and show only what changed"
 readme = "README.md"
 authors = [

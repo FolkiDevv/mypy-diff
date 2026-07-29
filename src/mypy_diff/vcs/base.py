@@ -43,8 +43,14 @@ class Runner:
             argv,
             cwd=self.cwd,
             capture_output=True,
-            text=True,
             check=False,
+            # jj and git emit UTF-8. `text=True` alone decodes with the locale codepage
+            # (cp1252 on a stock Windows box), which dies on the first non-ASCII byte — a
+            # Cyrillic commit message, or a Unicode arrow in a jj hint. The decode happens in
+            # subprocess's reader thread, so the failure surfaces as stdout being None.
+            text=True,
+            encoding="utf-8",
+            errors="replace",
             # Force machine-readable, locale-independent output.
             env={**os.environ, "LC_ALL": "C", "NO_COLOR": "1"},
         )
