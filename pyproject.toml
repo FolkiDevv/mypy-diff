@@ -28,7 +28,7 @@ mypy-diff-jj = "mypy_diff.cli:jj_main"
 mypy-diff-git = "mypy_diff.cli:git_main"
 
 [project.urls]
-Homepage = "https://github.com/FolkiDevv/mypy-diff"
+Homepage = "https://sourcecraft.dev/folkidevv/mypy-diff"
 
 [build-system]
 requires = ["uv_build>=0.11.32,<0.12.0"]
