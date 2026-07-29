@@ -118,11 +118,15 @@ def run_mypy(
     workdir: Path,
     mypy_args: tuple[str, ...],
     cache_dir: Path,
+    prog: str = "mypy-diff",
 ) -> MypyRun:
     """Run mypy inside ``workdir`` and parse its diagnostics.
 
     ``cache_dir`` is per-revision so the two runs never invalidate each other's incremental
     cache — and so neither of them touches the developer's own ``.mypy_cache``.
+
+    ``prog`` only names the command in error hints, so they show the entry point the user
+    actually typed.
     """
     argv = [*mypy.command, *_FORCED_ARGS, f"--cache-dir={cache_dir}", *mypy_args]
     completed = subprocess.run(
@@ -139,10 +143,7 @@ def run_mypy(
     )
 
     if completed.returncode >= 2:
-        raise MypyDiffError(
-            f"mypy failed with exit code {completed.returncode}.",
-            *_fatal_details(completed),
-        )
+        raise _fatal_error(completed, prog)
 
     messages, skipped = parse_json_output(completed.stdout, workdir)
     return MypyRun(
@@ -154,14 +155,34 @@ def run_mypy(
     )
 
 
-def _fatal_details(completed: subprocess.CompletedProcess[str]) -> list[str]:
+#: Ways mypy says "you did not tell me what to analyse". The first is what it actually prints
+#: for a bare invocation ("Missing target module, package, files, or command."); the others
+#: cover configs that name paths which do not exist.
+_NO_TARGET_MARKERS = ("missing target", "cannot read file", "no files")
+
+
+def _fatal_error(completed: subprocess.CompletedProcess[str], prog: str) -> MypyDiffError:
     details = [
         line for line in (completed.stderr or completed.stdout).strip().splitlines() if line.strip()
     ]
-    if any("Cannot read file" in line or "no files" in line.lower() for line in details):
-        details.append("")
-        details.append("Pass the paths to check after `--`, e.g.:  mypy-diff-git -- src tests")
-    return details
+
+    if any(marker in line.lower() for line in details for marker in _NO_TARGET_MARKERS):
+        # mypy answers this one with a full usage dump, which buries the actual problem.
+        # Drop it and say what to do instead.
+        return MypyDiffError(
+            "mypy has no files to check.",
+            "Your mypy config sets no `files`, `packages` or `modules`, so mypy does not",
+            "know what to analyse.",
+            "",
+            "Either pass the paths explicitly:",
+            f"    {prog} -- src tests",
+            "",
+            "or set them in your mypy config, e.g. in pyproject.toml:",
+            "    [tool.mypy]",
+            '    files = ["src", "tests"]',
+        )
+
+    return MypyDiffError(f"mypy failed with exit code {completed.returncode}.", *details)
 
 
 def parse_json_output(stdout: str, workdir: Path) -> tuple[tuple[MypyMessage, ...], int]:

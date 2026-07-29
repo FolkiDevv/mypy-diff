@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
 from mypy_diff import MypyDiffError
-from mypy_diff.mypy_exec import resolve_mypy, split_command
+from mypy_diff.mypy_exec import _fatal_error, resolve_mypy, split_command
 
 
 class TestSplitCommand:
@@ -47,6 +48,55 @@ class TestSplitCommand:
 
     def test_empty_command(self) -> None:
         assert split_command("   ") == ()
+
+
+class TestFatalError:
+    """How a mypy exit code >= 2 is turned into a message.
+
+    The "no targets" case used to slip through: the detection looked for "no files"/"Cannot
+    read file" while mypy actually prints "Missing target module, package, files, or command."
+    """
+
+    #: Verbatim from mypy 1.x for a bare invocation with no targets configured.
+    MISSING_TARGET = (
+        "usage: mypy [-h] [-v] [-V] [more flags]\n"
+        "            [-m MODULE] [-p PACKAGE] [-c PROGRAM_TEXT]\n"
+        "mypy: error: Missing target module, package, files, or command.\n"
+    )
+
+    def fatal(self, stderr: str, prog: str = "mypy-diff-git") -> MypyDiffError:
+        completed = subprocess.CompletedProcess(["mypy"], 2, stdout="", stderr=stderr)
+        return _fatal_error(completed, prog)
+
+    def rendered(self, error: MypyDiffError) -> str:
+        return "\n".join([error.message, *error.details])
+
+    def test_missing_target_is_explained(self) -> None:
+        text = self.rendered(self.fatal(self.MISSING_TARGET))
+        assert "mypy has no files to check" in text
+        assert "-- src tests" in text
+        assert 'files = ["src", "tests"]' in text
+
+    def test_missing_target_drops_the_usage_dump(self) -> None:
+        """The usage block buries the real problem; it must not reach the user."""
+        text = self.rendered(self.fatal(self.MISSING_TARGET))
+        assert "usage: mypy" not in text
+        assert "-m MODULE" not in text
+
+    @pytest.mark.parametrize("prog", ["mypy-diff-jj", "mypy-diff-git"])
+    def test_hint_names_the_command_actually_run(self, prog: str) -> None:
+        text = self.rendered(self.fatal(self.MISSING_TARGET, prog=prog))
+        assert f"{prog} -- src tests" in text
+
+    def test_unreadable_configured_path_is_also_explained(self) -> None:
+        text = self.rendered(self.fatal("mypy: error: Cannot read file 'nope.py': No such file"))
+        assert "mypy has no files to check" in text
+
+    def test_other_failures_keep_their_output(self) -> None:
+        text = self.rendered(self.fatal("Traceback...\nAssertionError: plugin exploded\n"))
+        assert "mypy failed with exit code 2" in text
+        assert "plugin exploded" in text
+        assert "no files to check" not in text
 
 
 class TestResolveMypy:

@@ -289,6 +289,24 @@ def test_clean_cache_works_outside_a_repository(
 # ------------------------------------------------------------------ failures
 
 
+def test_no_targets_reports_an_actionable_error(repo: Repo) -> None:
+    """A bare run in a project whose mypy config names no files.
+
+    The fixture's [tool.mypy] has no `files` key, so this is exactly what a user hits when
+    they type `mypy-diff-jj` with nothing after it.
+    """
+    result = invoke(repo)
+
+    assert result.exit_code == EXIT_FAILURE
+    assert "mypy has no files to check" in result.output
+    assert f"mypy-diff-{repo.vcs} -- src tests" in result.output
+    assert 'files = ["src", "tests"]' in result.output
+    # The raw usage dump is noise and must not survive.
+    assert "usage: mypy" not in result.output
+    # Regression: rich parses `[tool.mypy]` as markup and drops it unless the text is escaped.
+    assert "[tool.mypy]" in result.output
+
+
 def test_missing_mypy_reports_an_actionable_error(repo: Repo) -> None:
     app = build_app(JjBackend if repo.vcs == "jj" else GitBackend)
     result = runner.invoke(

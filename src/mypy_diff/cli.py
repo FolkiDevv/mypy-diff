@@ -15,6 +15,7 @@ from typing import Annotated
 
 import typer
 from rich.console import Console
+from rich.text import Text
 
 from . import MypyDiffError, __version__
 from .cache import ResultCache
@@ -134,9 +135,11 @@ def build_app(backend_type: type[GitBackend] | type[JjBackend]) -> typer.Typer:
                 verbose=verbose,
             )
         except MypyDiffError as failure:
-            errors.print(f"[bold red]error:[/bold red] {failure.message}")
+            # Text(), not markup strings: messages quote mypy output and config snippets, and
+            # rich would silently eat anything bracketed — `[return-value]`, `[tool.mypy]`.
+            errors.print(Text("error: ", style="bold red") + Text(failure.message))
             for detail in failure.details:
-                errors.print(f"  {detail}" if detail else "")
+                errors.print(Text(f"  {detail}") if detail else "")
             raise typer.Exit(EXIT_FAILURE) from failure
         except KeyboardInterrupt:  # pragma: no cover - interactive only
             errors.print("[yellow]interrupted[/yellow]")
@@ -270,7 +273,13 @@ def _messages_for(
 
         # The stack owns the mypy cache directory too: with --no-cache it is a temporary
         # directory that disappears with the worktree.
-        run = run_mypy(mypy, workdir, mypy_args, cache.mypy_cache_dir(revision, stack))
+        run = run_mypy(
+            mypy,
+            workdir,
+            mypy_args,
+            cache.mypy_cache_dir(revision, stack),
+            prog=f"mypy-diff-{backend.name}",
+        )
 
     if verbose and run.skipped_lines:
         console.print(f"[dim]skipped {run.skipped_lines} non-JSON line(s) from mypy[/dim]")

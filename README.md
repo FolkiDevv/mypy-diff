@@ -63,6 +63,23 @@ mypy-diff-jj -- src tests         # everything after `--` goes to mypy, for both
 mypy-diff-git -b main -- src      # compare against where you branched off main
 ```
 
+### What gets checked
+
+mypy-diff never invents targets — it passes them straight through, so the same rules apply as for
+running `mypy` yourself. Either your mypy config names them:
+
+```toml
+[tool.mypy]
+files = ["src", "tests"]
+```
+
+…or you give them after `--`. With neither, mypy has nothing to analyse and the run stops with a
+message telling you so.
+
+Targets are deliberately not defaulted to `.`: the base revision is checked in a clean worktree
+while the target is your working copy, so `.` would drag `.venv` into one side only and report the
+whole virtualenv as new errors.
+
 ### Choosing revisions
 
 **Base** (`-b`, `--base`) defaults to *the latest named ancestor that has been pushed to git*.
