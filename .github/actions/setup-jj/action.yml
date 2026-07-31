@@ -31,10 +31,13 @@ runs:
         esac
         url="https://github.com/jj-vcs/jj/releases/download/v${JJ_VERSION}/jj-v${JJ_VERSION}-${target}.tar.gz"
         echo "Downloading $url"
-        curl --fail --silent --show-error --location "$url" -o /tmp/jj.tar.gz
-        # The archive holds the binary at the root; pull just that out.
-        tar -xzf /tmp/jj.tar.gz -C /tmp jj
-        install -m 0755 /tmp/jj /usr/local/bin/jj
+        tmp="$(mktemp -d)"
+        curl --fail --silent --show-error --location "$url" -o "$tmp/jj.tar.gz"
+        # Entries are stored as ./jj, ./LICENSE, ./README.md, so `tar ... jj` finds no such
+        # member. Extract everything and pick the binary out — naming `./jj` would work on GNU
+        # tar but wildcard/member matching differs on the BSD tar the macOS runners ship.
+        tar -xzf "$tmp/jj.tar.gz" -C "$tmp"
+        install -m 0755 "$tmp/jj" /usr/local/bin/jj
 
     - name: Install jj (Windows)
       if: runner.os == 'Windows'
