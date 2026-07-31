@@ -53,9 +53,7 @@ def render(
 # ------------------------------------------------------------------ human output
 
 
-def _render_human(
-    result: DiffResult, console: Console, only: Only, show_unchanged: bool
-) -> None:
+def _render_human(result: DiffResult, console: Console, only: Only, show_unchanged: bool) -> None:
     header = Text()
     header.append("mypy-diff", style="bold")
     header.append("  base: ", style="dim")

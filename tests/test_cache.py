@@ -30,9 +30,7 @@ MESSAGES = (
 
 
 def revision(commit_id: str = COMMIT, working_copy: bool = False) -> RevisionInfo:
-    return RevisionInfo(
-        commit_id=commit_id, short_id=commit_id[:8], is_working_copy=working_copy
-    )
+    return RevisionInfo(commit_id=commit_id, short_id=commit_id[:8], is_working_copy=working_copy)
 
 
 def cache(tmp_path: Path, enabled: bool = True) -> ResultCache:

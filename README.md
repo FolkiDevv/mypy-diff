@@ -1,5 +1,9 @@
 # mypy-diff
 
+[![CI](https://github.com/FolkiDevv/mypy-diff/actions/workflows/ci.yml/badge.svg)](https://github.com/FolkiDevv/mypy-diff/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/mypy-diff.svg)](https://pypi.org/project/mypy-diff/)
+[![Python](https://img.shields.io/pypi/pyversions/mypy-diff.svg)](https://pypi.org/project/mypy-diff/)
+
 Show only the mypy errors **your** work introduced.
 
 On any non-trivial codebase `mypy` prints a wall of hundreds of errors, and the one question
@@ -32,10 +36,31 @@ Two commands, same behaviour, different version control:
 ## Install
 
 ```bash
-uv tool install --from https://github.com/FolkiDevv/mypy-diff.git mypy-diff
+uv tool install mypy-diff
 ```
 
-That installs **both** commands. From a checkout, use `uv tool install --from . mypy-diff`.
+That installs **both** commands. Or with pipx:
+
+```bash
+pipx install mypy-diff
+```
+
+<details>
+<summary>Installing from source</summary>
+
+Straight from the repository:
+
+```bash
+uv tool install --from git+https://github.com/FolkiDevv/mypy-diff.git mypy-diff
+```
+
+Or from a local checkout — add `--force` to overwrite an existing install:
+
+```bash
+uv tool install --from . mypy-diff
+```
+
+</details>
 
 Requirements:
 

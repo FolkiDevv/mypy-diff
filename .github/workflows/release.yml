@@ -1,0 +1,96 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  UV_VERSION: "0.11.32"
+
+permissions:
+  contents: read
+
+jobs:
+  # No release goes out on red tests.
+  check:
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v9
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+
+      - name: Tag must match the packaged version
+        # Catches the easy mistake of tagging before bumping pyproject.toml.
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          packaged=$(python -c "import tomllib,pathlib;print(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version'])")
+          echo "tag=$tag  pyproject=$packaged"
+          if [ "$tag" != "$packaged" ]; then
+            echo "::error::tag $tag does not match project.version $packaged"
+            exit 1
+          fi
+
+      - name: Build
+        # --no-sources proves the package builds without any local source overrides.
+        run: uv build --no-sources
+
+      - name: Smoke-test the built wheel
+        # Installs the real artifact into a clean environment and runs it. Catches broken entry
+        # points and a missing py.typed before anything reaches PyPI, where it is permanent.
+        run: |
+          set -euo pipefail
+          uv venv /tmp/probe
+          uv pip install --python /tmp/probe dist/*.whl
+          /tmp/probe/bin/mypy-diff-git --version
+          /tmp/probe/bin/mypy-diff-jj --version
+          python - <<'PY'
+          import zipfile, glob, sys
+          wheel = glob.glob("dist/*.whl")[0]
+          names = zipfile.ZipFile(wheel).namelist()
+          missing = [n for n in ("mypy_diff/py.typed",) if n not in names]
+          if missing:
+              sys.exit(f"missing from wheel: {missing}")
+          if not any(n.startswith("mypy_diff-") and "LICENSE" in n for n in names):
+              sys.exit("LICENSE is not in the wheel metadata")
+          print("wheel contents OK")
+          PY
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/mypy-diff
+    permissions:
+      # The only credential involved: PyPI trusted publishing exchanges this for a short-lived
+      # token. No API token is stored anywhere.
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist/
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v9
+        with:
+          version: ${{ env.UV_VERSION }}
+
+      - name: Publish to PyPI
+        # `always` makes a misconfigured trusted publisher fail loudly instead of quietly
+        # falling back to another auth method and reporting something unrelated.
+        run: uv publish --trusted-publishing always

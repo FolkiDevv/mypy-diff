@@ -138,9 +138,10 @@ def test_cleanup_stale_forgets_workspaces_whose_directory_is_gone(jj_repo: Repo)
         cwd=jj_repo.root,
     )
     shutil.rmtree(orphan)
-    assert "mypy-diff-orphan" in run(
-        [JJ, "workspace", "list", "--ignore-working-copy"], cwd=jj_repo.root
-    ).stdout
+    assert (
+        "mypy-diff-orphan"
+        in run([JJ, "workspace", "list", "--ignore-working-copy"], cwd=jj_repo.root).stdout
+    )
 
     jj.cleanup_stale()
 

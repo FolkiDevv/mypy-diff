@@ -164,9 +164,7 @@ class JjBackend:
         try:
             # `-r` supplies the *parents* of the new working-copy commit, so the checked-out
             # tree is exactly the tree of `rev`.
-            self._jj.run(
-                "workspace", "add", "--name", workspace, "-r", rev.commit_id, str(target)
-            )
+            self._jj.run("workspace", "add", "--name", workspace, "-r", rev.commit_id, str(target))
             yield target
         finally:
             self._jj.run("workspace", "forget", workspace, check=False)

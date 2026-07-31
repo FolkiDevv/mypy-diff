@@ -1,0 +1,58 @@
+name: Set up jj
+description: Install a pinned Jujutsu binary from the official GitHub releases.
+
+# jj is not in any package manager the runners ship with, and taiki-e/install-action does not
+# cover it, so we fetch the release binary. Pinning the version keeps a jj release from breaking
+# CI without warning.
+
+inputs:
+  version:
+    description: jj version to install, without the leading "v".
+    required: false
+    default: "0.43.0"
+
+runs:
+  using: composite
+  steps:
+    - name: Install jj (Linux, macOS)
+      if: runner.os != 'Windows'
+      shell: bash
+      env:
+        JJ_VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        case "${{ runner.os }}-${{ runner.arch }}" in
+          Linux-X64)   target=x86_64-unknown-linux-musl ;;
+          Linux-ARM64) target=aarch64-unknown-linux-musl ;;
+          # macos-latest runners are Apple Silicon.
+          macOS-ARM64) target=aarch64-apple-darwin ;;
+          macOS-X64)   target=x86_64-apple-darwin ;;
+          *) echo "::error::unsupported runner ${{ runner.os }}-${{ runner.arch }}"; exit 1 ;;
+        esac
+        url="https://github.com/jj-vcs/jj/releases/download/v${JJ_VERSION}/jj-v${JJ_VERSION}-${target}.tar.gz"
+        echo "Downloading $url"
+        curl --fail --silent --show-error --location "$url" -o /tmp/jj.tar.gz
+        # The archive holds the binary at the root; pull just that out.
+        tar -xzf /tmp/jj.tar.gz -C /tmp jj
+        install -m 0755 /tmp/jj /usr/local/bin/jj
+
+    - name: Install jj (Windows)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      env:
+        JJ_VERSION: ${{ inputs.version }}
+      run: |
+        $ErrorActionPreference = "Stop"
+        $url = "https://github.com/jj-vcs/jj/releases/download/v$env:JJ_VERSION/jj-v$env:JJ_VERSION-x86_64-pc-windows-msvc.zip"
+        Write-Host "Downloading $url"
+        $zip = Join-Path $env:RUNNER_TEMP "jj.zip"
+        $dir = Join-Path $env:RUNNER_TEMP "jj"
+        Invoke-WebRequest -Uri $url -OutFile $zip
+        Expand-Archive -Path $zip -DestinationPath $dir -Force
+        $dir | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+    - name: Verify
+      shell: bash
+      # Fails the job if jj did not actually land on PATH. Without this the jj tests would just
+      # skip themselves and the run would look green while covering half of what it claims.
+      run: jj --version
