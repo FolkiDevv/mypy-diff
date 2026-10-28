@@ -8,7 +8,9 @@ revisions must be checked from that subdirectory, not from the root.
 
 from __future__ import annotations
 
+import configparser
 import posixpath
+import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -17,6 +19,45 @@ from . import MypyDiffError
 #: Files that mark a directory as the one mypy should run in. The same set mypy itself looks
 #: for when it searches for a config file.
 CONFIG_FILES = ("mypy.ini", ".mypy.ini", "pyproject.toml", "setup.cfg")
+
+
+def has_mypy_config(directory: Path) -> bool:
+    """Whether ``directory`` holds a config file mypy would actually use.
+
+    Like mypy itself, pyproject.toml and setup.cfg only count when they have a mypy section —
+    a pyproject.toml that just packages a library says nothing about where mypy should run.
+    """
+    for name in CONFIG_FILES:
+        path = directory / name
+        if not path.is_file():
+            continue
+        if name == "pyproject.toml":
+            if _has_tool_mypy(path):
+                return True
+        elif name == "setup.cfg":
+            if _has_mypy_section(path):
+                return True
+        else:
+            return True
+    return False
+
+
+def _has_tool_mypy(path: Path) -> bool:
+    try:
+        data = tomllib.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+        return False
+    tool = data.get("tool")
+    return isinstance(tool, dict) and "mypy" in tool
+
+
+def _has_mypy_section(path: Path) -> bool:
+    parser = configparser.RawConfigParser()
+    try:
+        parser.read(path, encoding="utf-8")
+    except (configparser.Error, UnicodeDecodeError):
+        return False
+    return parser.has_section("mypy")
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,7 +102,7 @@ def find_project(root: Path, cwd: Path, explicit: Path | None = None) -> Project
     if not current.is_relative_to(root):
         return Project(root)
     while current != root:
-        if any((current / name).is_file() for name in CONFIG_FILES):
+        if has_mypy_config(current):
             return Project(root, _relative(current, root, str(current)))
         current = current.parent
     return Project(root)

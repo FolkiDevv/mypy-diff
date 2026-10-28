@@ -112,8 +112,8 @@ say in `backend/`. mypy reads its config, and resolves the `files` it lists, rel
 directory it runs in, so mypy-diff runs it in the **project directory** for both revisions:
 
 - run mypy-diff from anywhere inside `backend/` and it picks the nearest directory above you
-  with a mypy config (`mypy.ini`, `.mypy.ini`, `pyproject.toml` or `setup.cfg`), stopping at
-  the repository root;
+  with a mypy config — `mypy.ini`, `.mypy.ini`, or a `pyproject.toml` / `setup.cfg` that has a
+  `[tool.mypy]` / `[mypy]` section — stopping at the repository root;
 - or name it explicitly: `mypy-diff-git --project backend`. A relative path starts at the
   current directory, like any other path argument, so this example is run from the repository
   root.

@@ -43,6 +43,23 @@ def test_every_mypy_config_file_counts(root: Path, name: str) -> None:
     assert find_project(root, root / "docs").subdir == "docs"
 
 
+@pytest.mark.parametrize(
+    ("name", "content"),
+    [
+        ("pyproject.toml", "[project]\nname = 'pkg'\n\n[tool.ruff]\nline-length = 100\n"),
+        ("setup.cfg", "[metadata]\nname = pkg\n\n[flake8]\nmax-line-length = 100\n"),
+        ("pyproject.toml", "this is [not toml"),
+    ],
+)
+def test_a_config_without_a_mypy_section_does_not_count(
+    root: Path, name: str, content: str
+) -> None:
+    """mypy ignores these, so running from their directory would resolve `files` wrongly."""
+    (root / "mypy.ini").write_text("[mypy]\nfiles = backend/src\n", encoding="utf-8")
+    (root / "docs" / name).write_text(content, encoding="utf-8")
+    assert find_project(root, root / "docs").subdir == "."
+
+
 def test_explicit_project_is_relative_to_the_cwd(root: Path) -> None:
     assert find_project(root, root / "docs", Path("../backend")).subdir == "backend"
 
