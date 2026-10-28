@@ -54,7 +54,8 @@ def _has_tool_mypy(path: Path) -> bool:
 def _has_mypy_section(path: Path) -> bool:
     parser = configparser.RawConfigParser()
     try:
-        parser.read(path, encoding="utf-8")
+        # mypy reads INI configs with the locale encoding; so must we, to agree on the result.
+        parser.read(path, encoding="locale")
     except (configparser.Error, UnicodeDecodeError):
         return False
     return parser.has_section("mypy")
