@@ -48,8 +48,8 @@ class RevisionInfo:
 class MypyMessage:
     """One diagnostic emitted by mypy.
 
-    ``path`` is always POSIX-style and relative to the root mypy was run from, so that a run
-    against the working copy and a run inside a temporary worktree produce comparable keys.
+    ``path`` is always POSIX-style and relative to the repository root, so that a run against
+    the working copy and a run inside a temporary worktree produce comparable keys.
     """
 
     path: str

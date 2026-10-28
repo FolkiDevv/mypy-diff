@@ -98,11 +98,29 @@ def short_tmp_path() -> Iterator[Path]:
         shutil.rmtree(directory, ignore_errors=True)
 
 
-def _seed(root: Path) -> None:
-    (root / "src").mkdir(parents=True, exist_ok=True)
-    (root / "pyproject.toml").write_text(PROJECT_CONFIG, encoding="utf-8")
-    (root / "src" / "clean.py").write_text(CLEAN_SOURCE, encoding="utf-8")
-    (root / "src" / "legacy.py").write_text(PREEXISTING_SOURCE, encoding="utf-8")
+#: The monorepo's config names its targets, relative to the project directory — so mypy only
+#: finds them when it runs there, not from the repository root.
+SUBPROJECT_CONFIG = """\
+[tool.mypy]
+python_version = "3.12"
+files = ["src"]
+"""
+
+#: Where the monorepo fixtures keep their Python project.
+SUBPROJECT = "backend"
+
+
+def _seed(root: Path, project: str | None = None) -> None:
+    """Write the fixture project at the root, or in the ``project`` subdirectory."""
+    directory = root if project is None else root / project
+    (directory / "src").mkdir(parents=True, exist_ok=True)
+    config = PROJECT_CONFIG if project is None else SUBPROJECT_CONFIG
+    (directory / "pyproject.toml").write_text(config, encoding="utf-8")
+    (directory / "src" / "clean.py").write_text(CLEAN_SOURCE, encoding="utf-8")
+    (directory / "src" / "legacy.py").write_text(PREEXISTING_SOURCE, encoding="utf-8")
+    if project is not None:
+        # Something non-Python at the root, the way a real monorepo looks.
+        (root / "README.md").write_text("monorepo\n", encoding="utf-8")
 
 
 @pytest.fixture
@@ -111,6 +129,16 @@ def git_repo(short_tmp_path: Path) -> Repo:
 
     The remote matters: the default base is derived from remote-tracking refs.
     """
+    return _make_git_repo(short_tmp_path)
+
+
+@pytest.fixture
+def git_monorepo(short_tmp_path: Path) -> Repo:
+    """Like `git_repo`, but the Python project lives in `backend/`."""
+    return _make_git_repo(short_tmp_path, SUBPROJECT)
+
+
+def _make_git_repo(short_tmp_path: Path, project: str | None = None) -> Repo:
     assert GIT is not None
     root = short_tmp_path / "work"
     root.mkdir()
@@ -119,7 +147,7 @@ def git_repo(short_tmp_path: Path) -> Repo:
     run([GIT, "config", "user.email", "test@example.com"], cwd=root)
     run([GIT, "config", "user.name", "Test"], cwd=root)
     run([GIT, "config", "commit.gpgsign", "false"], cwd=root)
-    _seed(root)
+    _seed(root, project)
     run([GIT, "add", "-A"], cwd=root)
     run([GIT, "commit", "-q", "-m", "initial"], cwd=root)
 
@@ -134,6 +162,16 @@ def git_repo(short_tmp_path: Path) -> Repo:
 @pytest.fixture
 def jj_repo(short_tmp_path: Path) -> Repo:
     """A jj workspace with one described commit bookmarked `main`, and a fresh empty `@`."""
+    return _make_jj_repo(short_tmp_path)
+
+
+@pytest.fixture
+def jj_monorepo(short_tmp_path: Path) -> Repo:
+    """Like `jj_repo`, but the Python project lives in `backend/`."""
+    return _make_jj_repo(short_tmp_path, SUBPROJECT)
+
+
+def _make_jj_repo(short_tmp_path: Path, project: str | None = None) -> Repo:
     assert JJ is not None
     root = short_tmp_path / "work"
     root.mkdir()
@@ -141,7 +179,7 @@ def jj_repo(short_tmp_path: Path) -> Repo:
     run([JJ, "git", "init"], cwd=root)
     run([JJ, "config", "set", "--repo", "user.name", "Test"], cwd=root)
     run([JJ, "config", "set", "--repo", "user.email", "test@example.com"], cwd=root)
-    _seed(root)
+    _seed(root, project)
     run([JJ, "describe", "-m", "initial"], cwd=root)
     run([JJ, "bookmark", "create", "main", "-r", "@"], cwd=root)
     run([JJ, "new"], cwd=root)

@@ -105,6 +105,23 @@ Targets are deliberately not defaulted to `.`: the base revision is checked in a
 while the target is your working copy, so `.` would drag `.venv` into one side only and report the
 whole virtualenv as new errors.
 
+### Projects in a subdirectory
+
+In a monorepo the Python code and its `pyproject.toml` often live below the repository root,
+say in `backend/`. mypy reads its config, and resolves the `files` it lists, relative to the
+directory it runs in, so mypy-diff runs it in the **project directory** for both revisions:
+
+- run mypy-diff from anywhere inside `backend/` and it picks the nearest directory above you
+  with a mypy config — `mypy.ini`, `.mypy.ini`, or a `pyproject.toml` / `setup.cfg` that has a
+  `[tool.mypy]` / `[mypy]` section — stopping at the repository root;
+- or name it explicitly: `mypy-diff-git --project backend`. A relative path starts at the
+  current directory, like any other path argument, so this example is run from the repository
+  root.
+
+Targets after `--` are then relative to that directory, as they would be for mypy itself.
+Reported paths are always relative to the repository root (`backend/src/app.py`), so
+`--format github` annotations land on the right files.
+
 ### Choosing revisions
 
 **Base** (`-b`, `--base`) defaults to *the latest named ancestor that has been pushed to git*.
@@ -135,6 +152,7 @@ is always removed afterwards, even if the run fails.
       --format FMT       pretty | plain | json | github            [pretty]
       --only WHAT        new | fixed | all                         [all]
       --show-unchanged   List unchanged errors instead of counting them.
+      --project DIR      Directory to run mypy in. Default: nearest mypy config above you.
       --mypy-cmd TEXT    Command used to run mypy, e.g. 'uv run mypy'.
       --cache-dir PATH   Where to keep cached results.
       --no-cache         Disable both caches for this run; leave nothing behind.
@@ -198,8 +216,10 @@ First match wins, and `--doctor` tells you which one was used:
 2. `$MYPY_DIFF_MYPY`
 3. the active virtualenv (`$VIRTUAL_ENV`)
 4. the project's `.venv`
-5. `uv run --project <root> mypy`
-6. `mypy` on `PATH`
+5. `uv run --project <project> mypy` (for a uv workspace member, uv uses the workspace's
+   environment)
+6. the repository root's `.venv`, when the project is in a subdirectory and uv is not available
+7. `mypy` on `PATH`
 
 Both revisions are always checked with the same mypy and the same arguments, and each revision
 gets its own incremental mypy cache — so the two runs never invalidate each other, and your own
