@@ -19,7 +19,7 @@ from typer.testing import CliRunner, Result
 from mypy_diff.cli import EXIT_FAILURE, EXIT_NEW_ERRORS, EXIT_OK, build_app
 from mypy_diff.vcs import GitBackend, JjBackend
 
-from .conftest import GIT, JJ, Repo, run
+from .conftest import GIT, JJ, SUBPROJECT, Repo, run
 
 runner = CliRunner()
 
@@ -373,6 +373,114 @@ def test_non_ascii_commit_messages_are_handled(repo: Repo) -> None:
 
     assert result.exit_code == EXIT_OK, result.output
     assert "error:" not in result.output
+
+
+# ------------------------------------------------------------------ project in a subdirectory
+
+
+@pytest.fixture(params=["git", "jj"])
+def monorepo(request: pytest.FixtureRequest) -> Repo:
+    """A repository whose Python project, config included, lives in `backend/`."""
+    if request.param == "git" and GIT is None:
+        pytest.skip("git is not installed")
+    if request.param == "jj" and JJ is None:
+        pytest.skip("jj is not installed")
+    return request.getfixturevalue(f"{request.param}_monorepo")  # type: ignore[no-any-return]
+
+
+@pytest.mark.parametrize("where", [SUBPROJECT, f"{SUBPROJECT}/src"])
+def test_project_in_a_subdirectory_is_found_from_inside_it(
+    monorepo: Repo, monkeypatch: pytest.MonkeyPatch, where: str
+) -> None:
+    """Regression: mypy used to run from the repository root and never saw backend's config."""
+    monorepo.write(f"{SUBPROJECT}/src/clean.py", BROKEN_SOURCE)
+    monkeypatch.chdir(monorepo.root / where)
+
+    result = invoke(monorepo)
+
+    assert result.exit_code == EXIT_NEW_ERRORS, result.output
+    assert "+ NEW (1)" in result.output
+    assert f"{SUBPROJECT}/src/clean.py:6" in result.output
+    assert "1 unchanged error" in result.output
+
+
+def test_project_option_selects_the_subdirectory(
+    monorepo: Repo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monorepo.write(f"{SUBPROJECT}/src/clean.py", BROKEN_SOURCE)
+    monkeypatch.chdir(monorepo.root)
+
+    result = invoke(monorepo, "--project", SUBPROJECT, "--format", "github")
+
+    assert result.exit_code == EXIT_NEW_ERRORS, result.output
+    # Annotations must carry repository-relative paths, or GitHub cannot place them.
+    assert f"::error file={SUBPROJECT}/src/clean.py,line=6" in result.output
+
+
+def test_subproject_line_shifts_are_matched(
+    monorepo: Repo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The shift tier reads both revisions' files, which needs repository-relative paths."""
+    legacy = f"{SUBPROJECT}/src/legacy.py"
+    monorepo.write(legacy, "# padding\n" * 40 + monorepo.read(legacy))
+    monkeypatch.chdir(monorepo.root / SUBPROJECT)
+
+    result = invoke(monorepo, "-b", "main", "--to", "main")
+    assert result.exit_code == EXIT_OK, result.output
+
+    result = invoke(monorepo)
+    assert result.exit_code == EXIT_OK, result.output
+    assert "+ NEW" not in result.output
+    assert "1 unchanged error" in result.output
+
+
+def test_subproject_doctor_names_the_project(
+    monorepo: Repo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(monorepo.root / SUBPROJECT)
+    result = invoke(monorepo, "--doctor")
+    assert result.exit_code == EXIT_OK
+    assert f"project          {SUBPROJECT}" in result.output
+
+
+def test_subproject_results_are_cached_apart_from_the_root(
+    monorepo: Repo, monkeypatch: pytest.MonkeyPatch, short_tmp_path: Path
+) -> None:
+    """One commit, two projects: a cached root run must not answer for backend/."""
+    cache = short_tmp_path / "cache"
+    monkeypatch.chdir(monorepo.root)
+    invoke(monorepo, "--", f"{SUBPROJECT}/src/clean.py", cache=cache)
+
+    monkeypatch.chdir(monorepo.root / SUBPROJECT)
+    result = invoke(monorepo, "-v", cache=cache)
+
+    assert "cache hit" not in result.output
+    assert "1 unchanged error" in result.output
+
+
+def test_project_missing_from_the_base_fails_cleanly(
+    repo: Repo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo.write("newproject/pyproject.toml", '[tool.mypy]\nfiles = ["."]\n')
+    repo.write("newproject/mod.py", "x: int = 1\n")
+    monkeypatch.chdir(repo.root / "newproject")
+
+    result = invoke(repo)
+
+    assert result.exit_code == EXIT_FAILURE
+    assert "`newproject` does not exist" in result.output
+
+
+def test_project_option_must_be_a_directory_in_the_repository(
+    repo: Repo, short_tmp_path: Path
+) -> None:
+    missing = invoke(repo, "--project", "no-such-dir")
+    assert missing.exit_code == EXIT_FAILURE
+    assert "not a directory" in missing.output
+
+    outside = invoke(repo, "--project", str(short_tmp_path))
+    assert outside.exit_code == EXIT_FAILURE
+    assert "outside the repository" in outside.output
 
 
 def test_version_flag(repo: Repo) -> None:

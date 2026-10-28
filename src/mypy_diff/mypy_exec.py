@@ -43,13 +43,16 @@ class MypyRun:
     skipped_lines: int
 
 
-def resolve_mypy(root: Path, explicit: str | None = None) -> tuple[ToolInfo, str]:
+def resolve_mypy(
+    project: Path, explicit: str | None = None, repo_root: Path | None = None
+) -> tuple[ToolInfo, str]:
     """Find a usable mypy. Returns the tool and a human-readable description of how.
 
-    Order: --mypy-cmd, $MYPY_DIFF_MYPY, the active virtualenv, the project's .venv,
-    `uv run --project`, then PATH.
+    Order: --mypy-cmd, $MYPY_DIFF_MYPY, the active virtualenv, the project's .venv, the
+    repository root's .venv (when the project lives in a subdirectory), `uv run --project`,
+    then PATH.
     """
-    for command, source in _mypy_candidates(root, explicit):
+    for command, source in _mypy_candidates(project, explicit, repo_root):
         tool = probe("mypy", command)
         if tool is not None:
             return require("mypy", tool, MIN_MYPY), source
@@ -83,7 +86,9 @@ def split_command(raw: str) -> tuple[str, ...]:
     return tuple(shlex.split(stripped))
 
 
-def _mypy_candidates(root: Path, explicit: str | None) -> list[tuple[tuple[str, ...], str]]:
+def _mypy_candidates(
+    project: Path, explicit: str | None, repo_root: Path | None = None
+) -> list[tuple[tuple[str, ...], str]]:
     candidates: list[tuple[tuple[str, ...], str]] = []
 
     if explicit:
@@ -100,11 +105,16 @@ def _mypy_candidates(root: Path, explicit: str | None) -> list[tuple[tuple[str, 
     if active_venv:
         candidates.append(((str(Path(active_venv) / _BIN_DIR / _MYPY_EXE),), "active virtualenv"))
 
-    candidates.append(((str(root / ".venv" / _BIN_DIR / _MYPY_EXE),), "project .venv"))
+    candidates.append(((str(project / ".venv" / _BIN_DIR / _MYPY_EXE),), "project .venv"))
+    if repo_root is not None and repo_root != project:
+        # A uv workspace keeps one .venv at its root even when the members live below it.
+        candidates.append(
+            ((str(repo_root / ".venv" / _BIN_DIR / _MYPY_EXE),), "repository root .venv")
+        )
 
     uv = shutil.which("uv")
-    if uv is not None and (root / "pyproject.toml").exists():
-        candidates.append(((uv, "run", "--project", str(root), "mypy"), "uv run --project"))
+    if uv is not None and (project / "pyproject.toml").exists():
+        candidates.append(((uv, "run", "--project", str(project), "mypy"), "uv run --project"))
 
     on_path = shutil.which("mypy")
     if on_path is not None:

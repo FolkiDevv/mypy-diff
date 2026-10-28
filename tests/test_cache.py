@@ -66,6 +66,14 @@ def test_key_ignores_the_working_copy_config(tmp_path: Path) -> None:
     assert subject.key(COMMIT, "mypy 2.3.0", ("src",)) == before
 
 
+def test_key_separates_projects_of_one_commit(tmp_path: Path) -> None:
+    """A monorepo commit holds several projects, each with its own results."""
+    subject = cache(tmp_path)
+    root = subject.key(COMMIT, "mypy 2.3.0", ())
+    assert subject.key(COMMIT, "mypy 2.3.0", (), ".") == root
+    assert subject.key(COMMIT, "mypy 2.3.0", (), "backend") != root
+
+
 def test_disabled_cache_neither_reads_nor_writes(tmp_path: Path) -> None:
     subject = cache(tmp_path, enabled=False)
     key = subject.key(COMMIT, "mypy 2.3.0", ("src",))
@@ -122,6 +130,17 @@ def test_mypy_cache_dir_separates_working_copy_from_its_parent(tmp_path: Path) -
 
     assert base != working
     assert working.name.endswith("-wc")
+
+
+def test_mypy_cache_dir_separates_projects(tmp_path: Path) -> None:
+    subject = cache(tmp_path)
+    with ExitStack() as stack:
+        root = subject.mypy_cache_dir(revision(working_copy=True), stack)
+        backend = subject.mypy_cache_dir(revision(working_copy=True), stack, "backend")
+        frontend = subject.mypy_cache_dir(revision(working_copy=True), stack, "frontend")
+
+    assert len({root, backend, frontend}) == 3
+    assert backend.name.endswith("-wc")
 
 
 def test_mypy_cache_dir_is_stable_across_calls(tmp_path: Path) -> None:

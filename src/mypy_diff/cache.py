@@ -29,7 +29,7 @@ from platformdirs import user_cache_dir
 
 from .models import MypyMessage, RevisionInfo
 
-CACHE_VERSION = 2
+CACHE_VERSION = 3
 
 #: How many recent *runs* to keep. Overridable so CI can keep more, or nothing at all.
 KEEP_ENV_VAR = "MYPY_DIFF_CACHE_KEEP"
@@ -65,8 +65,17 @@ class ResultCache:
 
     # -------------------------------------------------------------- result cache
 
-    def key(self, commit_id: str, mypy_version: str, mypy_args: tuple[str, ...]) -> str:
+    def key(
+        self,
+        commit_id: str,
+        mypy_version: str,
+        mypy_args: tuple[str, ...],
+        project: str = ".",
+    ) -> str:
         """Cache key for one run.
+
+        ``project`` is the directory mypy ran in, relative to the repository root: one commit
+        of a monorepo holds several projects, each with its own config and its own results.
 
         The mypy configuration is deliberately *not* part of this. Cached runs always happen
         inside a worktree, where the config file comes from the commit itself — so
@@ -74,7 +83,8 @@ class ResultCache:
         false misses every time pyproject.toml is touched.
         """
         digest = hashlib.sha256()
-        for part in (str(CACHE_VERSION), commit_id, mypy_version, "\x00".join(mypy_args)):
+        parts = (str(CACHE_VERSION), commit_id, project, mypy_version, "\x00".join(mypy_args))
+        for part in parts:
             digest.update(part.encode("utf-8"))
             digest.update(b"\x1f")
         return digest.hexdigest()
@@ -115,7 +125,7 @@ class ResultCache:
 
     # ----------------------------------------------------------- incremental cache
 
-    def mypy_cache_dir(self, revision: RevisionInfo, stack: ExitStack) -> Path:
+    def mypy_cache_dir(self, revision: RevisionInfo, stack: ExitStack, project: str = ".") -> Path:
         """Directory to hand mypy as ``--cache-dir`` for this revision.
 
         With caching disabled this is a temporary directory tied to ``stack``, so ``--no-cache``
@@ -130,6 +140,9 @@ class ResultCache:
         # The working copy's commit_id is its *parent's*. Without this suffix, a run whose base
         # is HEAD would point both runs at one directory and thrash it.
         suffix = "-wc" if revision.is_working_copy else ""
+        if project != ".":
+            # Projects of one monorepo commit must not share an incremental cache either.
+            suffix = f"-{hashlib.sha256(project.encode('utf-8')).hexdigest()[:8]}{suffix}"
         directory = self.directory / _MYPY_CACHE_SUBDIR / f"{revision.commit_id[:16]}{suffix}"
         # mypy writes deep inside, which never updates the top directory's mtime — and mtime is
         # what retention sorts on. Stamp it explicitly on every use.

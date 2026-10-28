@@ -8,6 +8,7 @@ factory and the two entry points only pick a backend.
 # metadata at runtime via inspect, using module globals — stringified annotations would fail
 # to see `backend_type`, which is a closure variable of build_app().
 
+import dataclasses
 import sys
 from contextlib import ExitStack
 from pathlib import Path
@@ -24,6 +25,7 @@ from .models import DiffResult, MypyMessage, RevisionInfo
 from .mypy_exec import resolve_mypy, run_mypy
 from .preflight import ToolInfo, find_tool, require_vcs
 from .progress import Activity
+from .project import Project, find_project
 from .render import Only, OutputFormat, make_console, render
 from .vcs import GitBackend, JjBackend, VcsBackend
 
@@ -73,6 +75,17 @@ def build_app(backend_type: type[GitBackend] | type[JjBackend]) -> typer.Typer:
                 "--show-unchanged", help="List unchanged errors instead of counting them."
             ),
         ] = False,
+        project_dir: Annotated[
+            Path | None,
+            typer.Option(
+                "--project",
+                help=(
+                    "Directory to run mypy in, for a project that lives in a subdirectory of "
+                    "the repository. Default: the nearest directory above the current one with "
+                    "a mypy config, or the repository root."
+                ),
+            ),
+        ] = None,
         mypy_cmd: Annotated[
             str | None,
             typer.Option("--mypy-cmd", help="Command used to run mypy, e.g. 'uv run mypy'."),
@@ -142,6 +155,7 @@ def build_app(backend_type: type[GitBackend] | type[JjBackend]) -> typer.Typer:
                 output_format=output_format,
                 only=only,
                 show_unchanged=show_unchanged,
+                project_dir=project_dir,
                 mypy_cmd=mypy_cmd,
                 cache_dir=cache_dir,
                 no_cache=no_cache,
@@ -179,6 +193,7 @@ def _run(
     output_format: OutputFormat,
     only: Only,
     show_unchanged: bool,
+    project_dir: Path | None,
     mypy_cmd: str | None,
     cache_dir: Path | None,
     no_cache: bool,
@@ -190,29 +205,31 @@ def _run(
         activity.step("Checking tools")
         vcs_tool = _resolve_vcs(backend_type.name, skip_version_check)
         backend = backend_type(vcs_tool.command[0], verbose=verbose)
-        root = backend.root()
+        project = find_project(backend.root(), Path.cwd(), project_dir)
 
-        mypy, mypy_source = resolve_mypy(root, mypy_cmd)
+        mypy, mypy_source = resolve_mypy(project.directory, mypy_cmd, project.root)
 
         if doctor:
-            _print_doctor(console, backend_type.name, vcs_tool, mypy, mypy_source, root)
+            _print_doctor(console, backend_type.name, vcs_tool, mypy, mypy_source, project)
             return EXIT_OK
 
         activity.step("Resolving revisions")
         base_rev, target_rev = _resolve_revisions(backend, base, to, tip)
         if verbose:
-            _print_verbose_header(console, backend, base_rev, target_rev, mypy, mypy_source)
+            _print_verbose_header(
+                console, backend, base_rev, target_rev, mypy, mypy_source, project
+            )
 
         cache = ResultCache(cache_dir, enabled=not no_cache)
         base_messages = _messages_for(
-            backend, base_rev, mypy, mypy_args, cache, root, console, verbose, activity
+            backend, base_rev, mypy, mypy_args, cache, project, console, verbose, activity
         )
         target_messages = _messages_for(
-            backend, target_rev, mypy, mypy_args, cache, root, console, verbose, activity
+            backend, target_rev, mypy, mypy_args, cache, project, console, verbose, activity
         )
 
         activity.step("Comparing results")
-        result = _diff(backend, base_rev, target_rev, base_messages, target_messages, root)
+        result = _diff(backend, base_rev, target_rev, base_messages, target_messages, project)
 
     render(result, console, output_format, only, show_unchanged)
 
@@ -271,7 +288,7 @@ def _messages_for(
     mypy: ToolInfo,
     mypy_args: tuple[str, ...],
     cache: ResultCache,
-    root: Path,
+    project: Project,
     console: Console,
     verbose: bool,
     activity: Activity,
@@ -282,7 +299,7 @@ def _messages_for(
 
     cache_key: str | None = None
     if not revision.is_working_copy:
-        cache_key = cache.key(revision.commit_id, mypy.display_version, mypy_args)
+        cache_key = cache.key(revision.commit_id, mypy.display_version, mypy_args, project.subdir)
         cached = cache.load(cache_key)
         if cached is not None:
             if verbose:
@@ -293,12 +310,18 @@ def _messages_for(
     with ExitStack() as stack:
         if revision.is_working_copy:
             # Run in place: it is faster and it is what the developer actually sees on disk.
-            workdir = root
+            workdir = project.directory
         else:
             activity.detail(f"Checking out {what}")
-            workdir = stack.enter_context(backend.worktree(revision))
+            checkout = stack.enter_context(backend.worktree(revision))
             if verbose:
-                console.print(f"[dim]checked out {revision.short_id} into {workdir}[/dim]")
+                console.print(f"[dim]checked out {revision.short_id} into {checkout}[/dim]")
+            workdir = project.directory_in(checkout)
+            if not workdir.is_dir():
+                raise MypyDiffError(
+                    f"The project directory `{project.subdir}` does not exist in {what}.",
+                    "Pick a base revision that already has it, e.g. `-b <rev>`.",
+                )
 
         activity.detail(f"Running mypy on {what}")
 
@@ -308,16 +331,23 @@ def _messages_for(
             mypy,
             workdir,
             mypy_args,
-            cache.mypy_cache_dir(revision, stack),
+            cache.mypy_cache_dir(revision, stack, project.subdir),
             prog=f"mypy-diff-{backend.name}",
         )
 
     if verbose and run.skipped_lines:
         console.print(f"[dim]skipped {run.skipped_lines} non-JSON line(s) from mypy[/dim]")
 
+    # mypy printed paths relative to the project directory. Report them relative to the
+    # repository instead: that is what `git show`, CI annotations and the root-level view expect.
+    messages = tuple(
+        dataclasses.replace(message, path=project.repo_path(message.path))
+        for message in run.messages
+    )
+
     if cache_key is not None:
-        cache.store(cache_key, run.messages)
-    return run.messages
+        cache.store(cache_key, messages)
+    return messages
 
 
 def _diff(
@@ -326,7 +356,7 @@ def _diff(
     target_rev: RevisionInfo,
     base_messages: tuple[MypyMessage, ...],
     target_messages: tuple[MypyMessage, ...],
-    root: Path,
+    project: Project,
 ) -> DiffResult:
     """Diff the two message sets, reading file contents lazily for the line-shift tier."""
     base_cache: dict[str, str | None] = {}
@@ -341,7 +371,9 @@ def _diff(
         if path not in target_cache:
             if target_rev.is_working_copy:
                 try:
-                    target_cache[path] = (root / path).read_text(encoding="utf-8", errors="replace")
+                    target_cache[path] = (project.root / path).read_text(
+                        encoding="utf-8", errors="replace"
+                    )
                 except OSError:
                     target_cache[path] = None
             else:
@@ -360,11 +392,13 @@ def _print_verbose_header(
     target_rev: RevisionInfo,
     mypy: ToolInfo,
     mypy_source: str,
+    project: Project,
 ) -> None:
     console.print(f"[dim]base   {base_rev.commit_id}  {base_rev.label()}[/dim]")
     console.print(f"[dim]target {target_rev.commit_id}  {target_rev.label()}[/dim]")
     command = " ".join(mypy.command)
     console.print(f"[dim]mypy   {command}  ({mypy_source}, {mypy.display_version})[/dim]")
+    console.print(f"[dim]in     {project.subdir}[/dim]")
     for command in backend.command_log():
         console.print(f"[dim]$ {command}[/dim]")
 
@@ -375,10 +409,11 @@ def _print_doctor(
     vcs_tool: ToolInfo,
     mypy: ToolInfo,
     mypy_source: str,
-    root: Path,
+    project: Project,
 ) -> None:
     console.print(f"mypy-diff {__version__}")
-    console.print(f"  repository root  {root}")
+    console.print(f"  repository root  {project.root}")
+    console.print(f"  {'project':<15}  {project.subdir}")
     console.print(f"  {vcs_name:<15}  {vcs_tool.display_version}  ({vcs_tool.command[0]})")
     console.print(f"  {'mypy':<15}  {mypy.display_version}  ({' '.join(mypy.command)})")
     console.print(f"  {'mypy found via':<15}  {mypy_source}")

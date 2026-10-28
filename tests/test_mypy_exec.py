@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from mypy_diff import MypyDiffError
-from mypy_diff.mypy_exec import _fatal_error, resolve_mypy, split_command
+from mypy_diff.mypy_exec import _fatal_error, _mypy_candidates, resolve_mypy, split_command
 
 
 class TestSplitCommand:
@@ -128,3 +128,18 @@ class TestResolveMypy:
         """A bad --mypy-cmd must fail loudly, not silently pick some other mypy."""
         with pytest.raises(MypyDiffError, match="Could not find a usable `mypy`"):
             resolve_mypy(tmp_path, "definitely-not-a-real-mypy")
+
+    def test_subproject_looks_in_its_own_venv_then_the_repository_root(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A uv workspace keeps one .venv at the root, above the member being checked."""
+        monkeypatch.delenv("MYPY_DIFF_MYPY", raising=False)
+        monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+        project = tmp_path / "backend"
+
+        sources = [source for _, source in _mypy_candidates(project, None, tmp_path)]
+
+        assert sources.index("project .venv") < sources.index("repository root .venv")
+        assert "repository root .venv" not in [
+            source for _, source in _mypy_candidates(tmp_path, None, tmp_path)
+        ]
