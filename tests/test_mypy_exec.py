@@ -129,17 +129,29 @@ class TestResolveMypy:
         with pytest.raises(MypyDiffError, match="Could not find a usable `mypy`"):
             resolve_mypy(tmp_path, "definitely-not-a-real-mypy")
 
-    def test_subproject_looks_in_its_own_venv_then_the_repository_root(
+    def test_subproject_looks_in_its_own_venv_then_uv_then_the_repository_root(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A uv workspace keeps one .venv at the root, above the member being checked."""
+        """The root .venv is only a fallback: the root may be an unrelated project.
+
+        uv knows whether the subproject is a workspace member using the root environment or a
+        project of its own, so it gets asked first.
+        """
         monkeypatch.delenv("MYPY_DIFF_MYPY", raising=False)
         monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+        monkeypatch.setattr("shutil.which", lambda name: f"/fake/bin/{name}")
         project = tmp_path / "backend"
+        project.mkdir()
+        (project / "pyproject.toml").write_text("[project]\nname = 'backend'\n", encoding="utf-8")
 
         sources = [source for _, source in _mypy_candidates(project, None, tmp_path)]
 
-        assert sources.index("project .venv") < sources.index("repository root .venv")
+        assert sources == [
+            "project .venv",
+            "uv run --project",
+            "repository root .venv",
+            "PATH",
+        ]
         assert "repository root .venv" not in [
             source for _, source in _mypy_candidates(tmp_path, None, tmp_path)
         ]

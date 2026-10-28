@@ -48,9 +48,9 @@ def resolve_mypy(
 ) -> tuple[ToolInfo, str]:
     """Find a usable mypy. Returns the tool and a human-readable description of how.
 
-    Order: --mypy-cmd, $MYPY_DIFF_MYPY, the active virtualenv, the project's .venv, the
-    repository root's .venv (when the project lives in a subdirectory), `uv run --project`,
-    then PATH.
+    Order: --mypy-cmd, $MYPY_DIFF_MYPY, the active virtualenv, the project's .venv,
+    `uv run --project`, the repository root's .venv (when the project lives in a
+    subdirectory), then PATH.
     """
     for command, source in _mypy_candidates(project, explicit, repo_root):
         tool = probe("mypy", command)
@@ -106,15 +106,19 @@ def _mypy_candidates(
         candidates.append(((str(Path(active_venv) / _BIN_DIR / _MYPY_EXE),), "active virtualenv"))
 
     candidates.append(((str(project / ".venv" / _BIN_DIR / _MYPY_EXE),), "project .venv"))
-    if repo_root is not None and repo_root != project:
-        # A uv workspace keeps one .venv at its root even when the members live below it.
-        candidates.append(
-            ((str(repo_root / ".venv" / _BIN_DIR / _MYPY_EXE),), "repository root .venv")
-        )
 
     uv = shutil.which("uv")
     if uv is not None and (project / "pyproject.toml").exists():
+        # uv picks the right environment itself: the workspace's for a workspace member, the
+        # project's own otherwise.
         candidates.append(((uv, "run", "--project", str(project), "mypy"), "uv run --project"))
+
+    if repo_root is not None and repo_root != project:
+        # Without uv, a workspace member's environment is the root .venv. It goes after uv
+        # because the root may just as well be an unrelated project with other dependencies.
+        candidates.append(
+            ((str(repo_root / ".venv" / _BIN_DIR / _MYPY_EXE),), "repository root .venv")
+        )
 
     on_path = shutil.which("mypy")
     if on_path is not None:

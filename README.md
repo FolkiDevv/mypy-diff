@@ -114,7 +114,9 @@ directory it runs in, so mypy-diff runs it in the **project directory** for both
 - run mypy-diff from anywhere inside `backend/` and it picks the nearest directory above you
   with a mypy config (`mypy.ini`, `.mypy.ini`, `pyproject.toml` or `setup.cfg`), stopping at
   the repository root;
-- or name it explicitly from anywhere in the repository: `mypy-diff-git --project backend`.
+- or name it explicitly: `mypy-diff-git --project backend`. A relative path starts at the
+  current directory, like any other path argument, so this example is run from the repository
+  root.
 
 Targets after `--` are then relative to that directory, as they would be for mypy itself.
 Reported paths are always relative to the repository root (`backend/src/app.py`), so
@@ -214,8 +216,9 @@ First match wins, and `--doctor` tells you which one was used:
 2. `$MYPY_DIFF_MYPY`
 3. the active virtualenv (`$VIRTUAL_ENV`)
 4. the project's `.venv`
-5. the repository root's `.venv`, when the project is in a subdirectory (a uv workspace)
-6. `uv run --project <project> mypy`
+5. `uv run --project <project> mypy` (for a uv workspace member, uv uses the workspace's
+   environment)
+6. the repository root's `.venv`, when the project is in a subdirectory and uv is not available
 7. `mypy` on `PATH`
 
 Both revisions are always checked with the same mypy and the same arguments, and each revision
