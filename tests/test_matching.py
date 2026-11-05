@@ -486,3 +486,15 @@ def test_a_moved_line_needs_a_neighbour_that_moved_with_it() -> None:
         },
     )
     assert len(result.new) == 1
+
+
+def test_a_renamed_one_line_module_keeps_its_error_unchanged() -> None:
+    """A one-line file has no neighbouring lines; the whole file moving is evidence enough."""
+    text = 'value: int = "x"\n'
+    result = diff(
+        [message(path="pkg/old.py", line=1, code="assignment", text="Incompatible types")],
+        [message(path="pkg/new.py", line=1, code="assignment", text="Incompatible types")],
+        files={"pkg/old.py": (text, None), "pkg/new.py": (None, text)},
+    )
+    assert result.new == ()
+    assert len(result.unchanged) == 1

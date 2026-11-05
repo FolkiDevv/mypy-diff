@@ -33,9 +33,11 @@ from .mypy_exec import (
     check_mypy_args,
     checkout_environment,
     inspect_environment,
+    move_targets_into,
     repository_import_dirs,
     resolve_mypy,
     run_mypy,
+    working_copy_reads,
 )
 from .preflight import ToolInfo, find_tool, require_vcs
 from .progress import Activity
@@ -493,45 +495,22 @@ def _line_still_present(
     return bool(wanted) and any(line.strip() == wanted for line in current.splitlines())
 
 
-def _into_checkout(arguments: tuple[str, ...], root: Path, checkout: Path) -> tuple[str, ...]:
-    """Absolute paths into the working copy, moved to the same place in the checkout."""
-    root = root.resolve()
-    moved: list[str] = []
-    for argument in arguments:
-        if os.path.isabs(argument) and Path(argument).resolve().is_relative_to(root):
-            argument = str(checkout / Path(argument).resolve().relative_to(root))
-        moved.append(argument)
-    return tuple(moved)
-
-
-def _check_checkout_was_used(
-    paths: Iterable[str],
-    workdir: Path,
-    checkout: Path,
-    project: Project,
-    revision: RevisionInfo,
-) -> None:
+def _refuse_working_copy_reads(reads: list[Path], revision: RevisionInfo) -> None:
     """Refuse a result for a revision that was partly checked from the working copy.
 
     mypy read files of the working copy while checking the checkout — whether or not they
     produced errors: an import path still points there. The result would describe neither
     revision, and caching it would keep it.
     """
-    root = project.root.resolve()
-    inside = checkout.resolve()
-    for path in paths:
-        if not path:
-            continue
-        location = (workdir / path).resolve()
-        if location.is_relative_to(root) and not location.is_relative_to(inside):
-            raise MypyDiffError(
-                f"Checking {_describe(revision)} read files from your working copy, e.g. "
-                f"{location.relative_to(root).as_posix()}.",
-                "mypy found them through a path that points into the working copy, not into",
-                "the checkout of that revision, so its result would be wrong. Typically an",
-                "absolute `mypy_path` or `files` entry in the mypy config: make it relative to",
-                'the config instead, e.g.  mypy_path = "$MYPY_CONFIG_FILE_DIR/lib".',
-            )
+    if reads:
+        raise MypyDiffError(
+            f"Checking {_describe(revision)} read files from your working copy, e.g. "
+            f"{reads[0].as_posix()}.",
+            "mypy found them through a path that points into the working copy, not into",
+            "the checkout of that revision, so its result would be wrong. Typically an",
+            "absolute `mypy_path` or `files` entry in the mypy config: make it relative to",
+            'the config instead, e.g.  mypy_path = "$MYPY_CONFIG_FILE_DIR/lib".',
+        )
 
 
 def _messages_for(
@@ -573,6 +552,7 @@ def _messages_for(
 
     run_env: dict[str, str] = {}
     checkout: Path | None = None
+    prefix = inspected.prefix if inspected is not None else ""
     with ExitStack() as stack:
         if revision.is_working_copy:
             # Run in place: it is faster and it is what the developer actually sees on disk.
@@ -603,7 +583,9 @@ def _messages_for(
         run = run_mypy(
             mypy,
             workdir,
-            mypy_args if checkout is None else _into_checkout(mypy_args, project.root, checkout),
+            mypy_args
+            if checkout is None
+            else move_targets_into(mypy_args, project.root, checkout, prefix),
             cache.mypy_cache_dir(revision, stack, project.subdir),
             prog=f"mypy-diff-{backend.name}",
             what=_describe(revision),
@@ -614,7 +596,8 @@ def _messages_for(
         )
         if checkout is not None:
             read = [*run.read_files, *(message.path for message in run.messages)]
-            _check_checkout_was_used(read, workdir, checkout, project, revision)
+            reads = working_copy_reads(read, workdir, checkout, project.root, prefix)
+            _refuse_working_copy_reads(reads, revision)
 
     if verbose and run.skipped_lines:
         console.print(f"[dim]skipped {run.skipped_lines} non-JSON line(s) from mypy[/dim]")

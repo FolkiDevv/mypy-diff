@@ -17,6 +17,7 @@ import shutil
 import signal
 import subprocess
 import sys
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -254,7 +255,7 @@ def _position_of(path: str, arguments: list[str]) -> int | None:
 
 
 #: mypy options that take a value as the next argument, so that value is not a target.
-_VALUE_OPTIONS = frozenset(
+VALUE_OPTIONS = frozenset(
     {
         "--python-version",
         "--platform",
@@ -296,7 +297,7 @@ def _names_targets(arguments: list[str]) -> bool:
     for argument in arguments:
         if argument in _TARGET_OPTIONS:
             return True
-        if not argument.startswith("-") and previous not in _VALUE_OPTIONS:
+        if not argument.startswith("-") and previous not in VALUE_OPTIONS:
             return True
         previous = argument
     return False
@@ -740,6 +741,58 @@ def checkout_environment(
 
 def _inside(entry: str, root: Path) -> bool:
     return Path(entry).resolve().is_relative_to(root)
+
+
+def move_targets_into(
+    arguments: tuple[str, ...], root: Path, checkout: Path, environment_prefix: str = ""
+) -> tuple[str, ...]:
+    """Absolute targets into the working copy, moved to the same place in ``checkout``.
+
+    Only targets: an option's value (`--python-executable /repo/.venv/bin/python`,
+    `--config-file /repo/mypy.ini`) names something the checkout may not have, such as an
+    ignored virtualenv, and stays as it is. So does anything inside mypy's own environment.
+    """
+    root = root.resolve()
+    prefix = Path(environment_prefix).resolve() if environment_prefix else None
+    moved: list[str] = []
+    previous = ""
+    for argument in arguments:
+        if (
+            os.path.isabs(argument)
+            and previous not in VALUE_OPTIONS
+            and Path(argument).resolve().is_relative_to(root)
+            and not (prefix is not None and Path(argument).resolve().is_relative_to(prefix))
+        ):
+            argument = str(checkout / Path(argument).resolve().relative_to(root))
+        moved.append(argument)
+        previous = argument
+    return tuple(moved)
+
+
+def working_copy_reads(
+    paths: Iterable[str], workdir: Path, checkout: Path, root: Path, environment_prefix: str = ""
+) -> list[Path]:
+    """Files mypy read from the working copy while checking ``checkout``, repository-relative.
+
+    Installed code is exempt: mypy's own environment (a `.venv` inside the repository is the
+    usual layout) and anything under site-packages is shared by both runs on purpose.
+    """
+    root = root.resolve()
+    inside = checkout.resolve()
+    prefix = Path(environment_prefix).resolve() if environment_prefix else None
+    found: list[Path] = []
+    for path in paths:
+        if not path:
+            continue
+        location = (workdir / path).resolve()
+        if not location.is_relative_to(root) or location.is_relative_to(inside):
+            continue
+        if prefix is not None and location.is_relative_to(prefix):
+            continue
+        if {"site-packages", "dist-packages"} & set(location.parts):
+            continue
+        found.append(location.relative_to(root))
+    return found
 
 
 def _interpreter_command(command: tuple[str, ...]) -> tuple[str, ...] | None:

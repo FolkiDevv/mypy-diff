@@ -25,10 +25,12 @@ from mypy_diff.mypy_exec import (
     check_mypy_args,
     checkout_environment,
     environment_fingerprint,
+    move_targets_into,
     repository_import_dirs,
     resolve_mypy,
     run_mypy,
     split_command,
+    working_copy_reads,
 )
 from mypy_diff.preflight import ToolInfo
 
@@ -544,3 +546,41 @@ class TestCheckoutImports:
         root, checkout = tmp_path / "repo", tmp_path / "checkout"
         (checkout / "src" / "mypy").mkdir(parents=True)
         assert "PYTHONPATH" not in checkout_environment(("src",), root, checkout)
+
+
+class TestCheckoutOnlyReads:
+    """What a base run read must come from its checkout — installed code excepted."""
+
+    def test_a_source_file_of_the_working_copy_is_a_leak(self, tmp_path: Path) -> None:
+        root, checkout = tmp_path / "repo", tmp_path / "checkout"
+        reads = working_copy_reads(
+            [str(root / "lib" / "shared.py"), "src/app.py"], checkout, checkout, root
+        )
+        assert reads == [Path("lib/shared.py")]
+
+    def test_installed_dependencies_inside_the_repository_are_not(self, tmp_path: Path) -> None:
+        """`uv` keeps `.venv` in the project: its site-packages are shared on purpose."""
+        root, checkout = tmp_path / "repo", tmp_path / "checkout"
+        venv = root / ".venv"
+        installed = venv / "lib" / "python3.12" / "site-packages" / "attrs" / "__init__.pyi"
+        elsewhere = root / "env" / "lib" / "site-packages" / "yaml" / "__init__.pyi"
+        reads = working_copy_reads(
+            [str(installed), str(elsewhere)], checkout, checkout, root, str(venv)
+        )
+        assert reads == []
+
+    def test_only_targets_are_moved_into_the_checkout(self, tmp_path: Path) -> None:
+        root, checkout = tmp_path / "repo", tmp_path / "checkout"
+        python = str(root / ".venv" / "bin" / "python")
+        arguments = ("--python-executable", python, str(root / "src"), "--strict")
+        assert move_targets_into(arguments, root, checkout) == (
+            "--python-executable",
+            python,
+            str(checkout / "src"),
+            "--strict",
+        )
+
+    def test_targets_inside_the_environment_stay(self, tmp_path: Path) -> None:
+        root, checkout = tmp_path / "repo", tmp_path / "checkout"
+        stub = str(root / ".venv" / "lib" / "stubs" / "x.pyi")
+        assert move_targets_into((stub,), root, checkout, str(root / ".venv")) == (stub,)

@@ -268,7 +268,8 @@ def _match_across_files(
     * that line left the old file (it occurs there fewer times than before) and arrived in the
       new one (more times than before) — two untouched `return value` lines in different
       modules, one fixed and one broken by the same change, are not a move;
-    * a neighbouring line moved along with it.
+    * a neighbouring line moved along with it — or the whole file did: a renamed module that
+      is otherwise unchanged (a one-line file has no neighbours to compare).
     """
     if not olds or not news:
         return [], list(olds), list(news)
@@ -287,6 +288,8 @@ def _match_across_files(
         arrived = target.count(new.path, source) > base.count(new.path, source)
         if not (left and arrived):
             return False
+        if base.text(old.path) == target.text(new.path):
+            return True
         before = base.neighbours(old.path, old.line)
         after = target.neighbours(new.path, new.line)
         return any(a and a == b for a, b in zip(before, after, strict=True))
@@ -332,6 +335,9 @@ class _LineReader:
     def get(self, path: str, line: int) -> str:
         lines = self._lines(path)
         return lines[line - 1] if 1 <= line <= len(lines) else ""
+
+    def text(self, path: str) -> tuple[str, ...]:
+        return tuple(self._lines(path))
 
     def count(self, path: str, source: str) -> int:
         return self._lines(path).count(source)

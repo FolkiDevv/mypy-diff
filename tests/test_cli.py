@@ -779,6 +779,27 @@ def test_a_base_check_that_reads_the_working_copy_is_refused(repo: Repo) -> None
     assert "lib/shared.py" in result.output
 
 
+def test_installed_packages_in_a_venv_inside_the_repository_are_fine(
+    repo: Repo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """uv keeps `.venv` in the project. Its site-packages are read by both runs on purpose;
+    they are not working-copy sources the base must not see."""
+    site = repo.root / ".venv" / "lib" / "python3.12" / "site-packages"
+    repo.write(".gitignore", ".venv/\n")
+    repo.write(".venv/lib/python3.12/site-packages/typedpkg/__init__.py", SHARED_STR)
+    repo.write(".venv/lib/python3.12/site-packages/typedpkg/py.typed", "")
+    repo.write("src/uses.py", USES_SHARED.replace("shared", "typedpkg"))
+    commit_as_main(repo, "uses an installed package")
+    repo.write("src/clean.py", BROKEN_SOURCE)
+    monkeypatch.setenv("PYTHONPATH", str(site))
+
+    result = invoke(repo, "-b", "main", "--", "src")
+
+    assert result.exit_code == EXIT_NEW_ERRORS, result.output
+    assert "+ NEW (1)" in result.output
+    assert "2 unchanged errors" in result.output
+
+
 def test_an_absolute_target_is_checked_in_the_checkout(repo: Repo) -> None:
     """`-- $PWD/src` used to make the base check the working copy's files."""
     repo.write("src/legacy.py", "# padding\n" + repo.read("src/legacy.py"))
