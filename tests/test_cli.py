@@ -121,6 +121,82 @@ def test_shifting_every_line_does_not_invent_new_errors(repo: Repo) -> None:
     assert "1 unchanged error" in result.output
 
 
+def commit_as_main(repo: Repo, message: str) -> None:
+    """Record the working copy as a new commit and point `main` at it."""
+    if repo.vcs == "jj":
+        assert JJ is not None
+        run([JJ, "describe", "-m", message], cwd=repo.root)
+        run([JJ, "bookmark", "set", "main", "-r", "@"], cwd=repo.root)
+        run([JJ, "new"], cwd=repo.root)
+    else:
+        assert GIT is not None
+        run([GIT, "add", "-A"], cwd=repo.root)
+        run([GIT, "commit", "-q", "-m", message], cwd=repo.root)
+
+
+REDEFINED_SOURCE = """\
+def handler() -> None: ...
+
+
+def handler() -> None: ...
+"""
+
+
+def test_a_redefinition_pushed_down_by_an_insertion_is_not_new(repo: Repo) -> None:
+    """mypy's text names the first definition's line ('already defined on line 1').
+
+    Inserting one line above changes that number, and the pre-existing error used to come out
+    as one NEW plus one FIXED.
+    """
+    repo.write("src/redefined.py", REDEFINED_SOURCE)
+    commit_as_main(repo, "legacy redefinition")
+    repo.write("src/redefined.py", "import os\n" + REDEFINED_SOURCE)
+
+    result = invoke(repo, "-b", "main", "--", "src")
+
+    assert result.exit_code == EXIT_OK, result.output
+    assert "No change in mypy errors." in result.output
+
+
+def test_a_repository_root_that_is_a_package_can_be_checked_out(repo: Repo) -> None:
+    """mypy names modules after the directories above them when they are packages.
+
+    The temporary checkout used to be called `mypy-diff-<pid>-0` (git) or `tree` (jj): an
+    invalid package name, or a different one than in the working copy.
+    """
+    repo.write("__init__.py", "")
+    repo.write("src/__init__.py", "")
+    commit_as_main(repo, "the repository is a package")
+
+    result = invoke(repo, "-b", "main", "--to", "main", "--", "src")
+
+    assert result.exit_code == EXIT_OK, result.output
+    assert "No change in mypy errors." in result.output
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="symlinks need privileges on Windows")
+def test_absolute_paths_through_a_symlinked_temp_dir_still_match(
+    repo: Repo, short_tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """macOS's temp dir is /var/..., a symlink to /private/var/....
+
+    mypy prints absolute paths through the physical directory, so they did not relativise
+    against the unresolved checkout path, and every error of the base looked fixed (and its
+    twin in the working copy new).
+    """
+    real = short_tmp_path / "real-tmp"
+    real.mkdir()
+    link = short_tmp_path / "link-tmp"
+    link.symlink_to(real, target_is_directory=True)
+    monkeypatch.setattr(tempfile, "tempdir", str(link))
+    repo.write("src/legacy.py", "# padding\n" + repo.read("src/legacy.py"))
+
+    result = invoke(repo, "-b", "main", "--", "--show-absolute-path", "src")
+
+    assert result.exit_code == EXIT_OK, result.output
+    assert "1 unchanged error" in result.output
+
+
 # ------------------------------------------------------------------ formats
 
 
@@ -153,6 +229,33 @@ def test_explicit_base_by_branch_name(repo: Repo) -> None:
     result = invoke(repo, "-b", "main", "--", "src")
     assert result.exit_code == EXIT_NEW_ERRORS
     assert "+ NEW (1)" in result.output
+
+
+@pytest.mark.skipif(GIT is None, reason="git is not installed")
+def test_base_is_derived_from_the_target_not_from_head(
+    git_repo: Repo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reviewing a branch from main: `-b main --to feature`.
+
+    main fixed the legacy error after feature forked. The fork point used to be computed
+    against HEAD (main), so feature's untouched legacy error came out NEW.
+    """
+    assert GIT is not None
+    monkeypatch.chdir(git_repo.root)
+    run([GIT, "checkout", "-q", "-b", "feature"], cwd=git_repo.root)
+    git_repo.write("src/clean.py", BROKEN_SOURCE)
+    run([GIT, "commit", "-qam", "feature adds an error"], cwd=git_repo.root)
+    run([GIT, "checkout", "-q", "main"], cwd=git_repo.root)
+    git_repo.write("src/legacy.py", "def broken() -> str:\n    return 'fixed on main'\n")
+    run([GIT, "commit", "-qam", "main fixes legacy"], cwd=git_repo.root)
+
+    for args in (["-b", "main", "--to", "feature"], ["--to", "feature"]):
+        result = invoke(git_repo, *args, "--", "src")
+        assert result.exit_code == EXIT_NEW_ERRORS, result.output
+        assert "+ NEW (1)" in result.output
+        assert "src/clean.py:6" in result.output
+        assert "FIXED" not in result.output
+        assert "1 unchanged error" in result.output
 
 
 def test_unknown_base_fails_cleanly(repo: Repo) -> None:
@@ -481,6 +584,52 @@ def test_project_option_must_be_a_directory_in_the_repository(
     outside = invoke(repo, "--project", str(short_tmp_path))
     assert outside.exit_code == EXIT_FAILURE
     assert "outside the repository" in outside.output
+
+
+def test_short_help_flag_is_ours_not_mypys(repo: Repo) -> None:
+    """`-h` used to be forwarded to mypy: two full runs, then 'No change in mypy errors.'"""
+    app = build_app(JjBackend if repo.vcs == "jj" else GitBackend)
+    result = runner.invoke(app, ["-h"], catch_exceptions=False)
+    assert result.exit_code == EXIT_OK
+    assert "--base" in result.output
+    assert "No change" not in result.output
+
+
+@pytest.mark.parametrize("argument", ["--help", "--version"])
+def test_mypy_arguments_that_print_no_report_are_rejected(repo: Repo, argument: str) -> None:
+    result = invoke(repo, "--", "src", argument)
+    assert result.exit_code == EXIT_FAILURE
+    assert "would then print no report" in result.output
+
+
+def test_a_crash_exits_with_the_failure_code_not_one(
+    repo: Repo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Exit code 1 means 'new errors found'; an uncaught exception must not look like that."""
+
+    def explode(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr("mypy_diff.cli.diff_messages", explode)
+    result = invoke(repo, "--exit-zero", "--", "src")
+    assert result.exit_code == EXIT_FAILURE
+    assert "mypy-diff crashed" in result.output
+
+
+def test_an_environment_change_misses_the_cache(
+    repo: Repo, short_tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A base cached under one environment must not be compared with a target checked under
+    another: after installing stubs, pre-existing errors used to come out NEW."""
+    cache = short_tmp_path / "cache"
+    monkeypatch.delenv("MYPYPATH", raising=False)
+    invoke(repo, "--", "src", cache=cache)
+    assert "cache hit" in invoke(repo, "-v", "--", "src", cache=cache).output
+
+    stubs = short_tmp_path / "stubs"
+    stubs.mkdir()
+    monkeypatch.setenv("MYPYPATH", str(stubs))
+    assert "cache hit" not in invoke(repo, "-v", "--", "src", cache=cache).output
 
 
 def test_version_flag(repo: Repo) -> None:

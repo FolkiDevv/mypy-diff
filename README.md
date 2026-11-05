@@ -133,10 +133,18 @@ That is almost always the point you branched from, so the diff shows exactly you
 | falls back to | local bookmark or tag → `trunk()` → `@-` | `origin/HEAD` → `main`/`master` → `HEAD~1` |
 | `-b NAME` accepts | a bookmark name or any revset | a branch, tag or any git revision |
 
-`-b NAME` compares against the **fork point** — the common ancestor of `NAME` and where you are.
+`-b NAME` compares against the **fork point** — the common ancestor of `NAME` and the target.
 This is what you want: if `main` moved ahead after you branched, unrelated fixes that landed on
 `main` would otherwise show up as "new errors" in your diff. Pass `--tip` for the literal branch
 head.
+
+With `mypy-diff-git`, a bare branch name also stands for its upstream and for `origin/NAME` /
+`upstream/NAME`. If your local `main` is behind one of them — you branched from `origin/main` and
+never fast-forwarded `main` — the newer fork point is used and a warning says so; otherwise every
+commit in between would be reported as yours. `-b <sha>` pins a commit exactly.
+
+The base is always derived from the **target**: with `--to feature`, both the fork point and the
+default base are computed from `feature`, not from whatever is checked out.
 
 **Target** (`--to`) defaults to the working copy *on disk*, including uncommitted changes. That
 run happens in place, so it is fast and reflects exactly what you are looking at. Any other
@@ -167,6 +175,10 @@ is always removed afterwards, even if the run fails.
 
 **Exit codes:** `0` no new errors · `1` new errors found · `2` mypy-diff itself failed.
 
+`2` also covers every run whose result cannot be trusted: mypy killed by a signal (out of
+memory), mypy exiting 1 without printing a single diagnostic (a wrapper such as `poetry run`
+that could not find mypy), or an internal crash. None of them is ever read as "no errors".
+
 ### Progress
 
 Two mypy runs take a while, so an interactive run shows which step it is on and how long it has
@@ -186,12 +198,21 @@ and under `--no-progress`.
 ### In CI
 
 ```yaml
+- uses: actions/checkout@v7
+  with:
+    fetch-depth: 0   # the fork point must be in the history
 - run: uv tool install mypy-diff
-- run: mypy-diff-git -b origin/main --format github -- src
+- run: mypy-diff-git -b origin/${{ github.base_ref }} --format github -- src
 ```
 
 The job fails only when the branch *adds* type errors; the pre-existing backlog is ignored, and
 `--format github` turns each new error into an inline annotation on the pull request.
+
+A shallow clone (the `actions/checkout` default) usually lacks the fork point. mypy-diff then
+stops with an error instead of silently comparing against the tip of `main`, which would report
+everything `main` did since you branched as your change. The one shallow case that works is a
+pull-request merge commit checked against its own base branch: its first parent is recorded in
+the commit itself.
 
 ## How matching works
 
@@ -206,6 +227,13 @@ reported as simultaneously fixed and new. Matching therefore runs in three tiers
 3. **By content** — same file, same error code and message text, position ignored. Repeated
    diagnostics pair up in order of appearance.
 
+Tiers 2 and 3 compare a normalised message, because some of mypy's text depends on code that did
+not change: `already defined on line 12` and local classes such as `mod.C@12` carry line numbers,
+and `; maybe "a" or "b"?` lists every similar name in scope, so it grows when an unrelated name is
+added anywhere. On a line that merely moved (tier 2) positional indices are ignored as well —
+`Argument 2` becomes `Argument 3` when a parameter is added on another line. The original text
+is what gets printed.
+
 Whatever is left over is genuinely **new** (only in the target) or **fixed** (only in the base).
 
 ## Which mypy gets run
@@ -214,6 +242,10 @@ First match wins, and `--doctor` tells you which one was used:
 
 1. `--mypy-cmd 'uv run mypy'`
 2. `$MYPY_DIFF_MYPY`
+
+   Both are pinned to the working copy, because the base runs in a temporary checkout: a relative
+   path such as `.venv/bin/mypy` is made absolute, and `uv run` gets `--project <project>` so that
+   it does not build a fresh environment from the base revision's lock file.
 3. the active virtualenv (`$VIRTUAL_ENV`)
 4. the project's `.venv`
 5. `uv run --project <project> mypy` (for a uv workspace member, uv uses the workspace's
@@ -237,9 +269,13 @@ Two caches live side by side, in a per-user directory from
 | Linux | `~/.cache/mypy-diff` |
 
 - **Result cache** — the diagnostics of one run, as `<hash>.json`. Keyed by commit id, mypy
-  version and mypy arguments. Written for any revision that resolves to a concrete commit; a
-  commit is immutable, so the entry stays valid forever and repeat runs skip that analysis
-  entirely. The dirty working copy is never cached. Tiny — a few hundred bytes per entry.
+  version, mypy arguments and a fingerprint of mypy's environment: the installed packages and
+  their versions (dependencies, stubs, plugins), the Python version, `MYPYPATH` and the user-level
+  mypy config. A commit is immutable, but what mypy resolves its imports against is not —
+  installing a stub package must not leave a stale base behind. Written for any revision that
+  resolves to a concrete commit, so repeat runs skip that analysis entirely. The dirty working
+  copy is never cached, and neither is a run that did not finish cleanly. Tiny — a few hundred
+  bytes per entry.
 - **Incremental mypy cache** — what mypy itself keeps, one directory per revision, handed over
   with `--cache-dir`. This keeps the two runs from invalidating each other and leaves your own
   `.mypy_cache` untouched. This is the part with real weight: **roughly 2 MB per revision.**

@@ -74,6 +74,18 @@ def test_key_separates_projects_of_one_commit(tmp_path: Path) -> None:
     assert subject.key(COMMIT, "mypy 2.3.0", (), "backend") != root
 
 
+def test_key_separates_environments(tmp_path: Path) -> None:
+    """A base computed before `pip install types-x` must not be reused after it.
+
+    The commit is the same, but mypy now resolves imports differently: comparing the stale base
+    with a fresh target reported pre-existing errors as NEW.
+    """
+    subject = cache(tmp_path)
+    before = subject.key(COMMIT, "mypy 2.3.0", ("src",), ".", "env-without-stubs")
+    assert subject.key(COMMIT, "mypy 2.3.0", ("src",), ".", "env-with-stubs") != before
+    assert subject.key(COMMIT, "mypy 2.3.0", ("src",), ".", "env-without-stubs") == before
+
+
 def test_disabled_cache_neither_reads_nor_writes(tmp_path: Path) -> None:
     subject = cache(tmp_path, enabled=False)
     key = subject.key(COMMIT, "mypy 2.3.0", ("src",))

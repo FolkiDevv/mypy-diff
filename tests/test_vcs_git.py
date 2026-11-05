@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 import pytest
@@ -141,3 +142,182 @@ def test_worktree_is_removed_even_if_the_body_raises(git_repo: Repo) -> None:
 
     assert not checkout.exists()
     assert "mypy-diff" not in run([GIT, "worktree", "list"], cwd=git_repo.root).stdout
+
+
+# ------------------------------------------------------------------ hooks
+
+
+@pytest.mark.parametrize("spelling", ["relative", "absolute"])
+def test_worktree_leaves_a_hooks_index_alone(
+    git_repo: Repo, monkeypatch: pytest.MonkeyPatch, spelling: str
+) -> None:
+    """git exports GIT_INDEX_FILE to a pre-commit hook.
+
+    With plain `git commit` it is the relative `.git/index`, and `git worktree add` used to fail
+    on it. With `git commit -a` it is a temporary index that becomes the commit: the checkout
+    wrote the base revision's tree into it, so the commit silently recorded the old tree.
+    """
+    git = backend(git_repo)
+    original = git.resolve("HEAD")
+    git_repo.write("src/clean.py", "x: int = 1\n")
+    commit(git_repo, "change")
+
+    if spelling == "relative":
+        monkeypatch.setenv("GIT_INDEX_FILE", ".git/index")
+        hook_index = git_repo.root / ".git" / "index"
+    else:
+        hook_index = git_repo.root.parent / "hook-index"
+        shutil.copyfile(git_repo.root / ".git" / "index", hook_index)
+        monkeypatch.setenv("GIT_INDEX_FILE", str(hook_index))
+    before = hook_index.read_bytes()
+
+    with git.worktree(original) as tree:
+        assert "def add(" in (tree / "src" / "clean.py").read_text(encoding="utf-8")
+
+    assert hook_index.read_bytes() == before
+
+
+# ------------------------------------------------------------------ the base follows the target
+
+
+def diverge(repo: Repo) -> tuple[str, str]:
+    """`feature` forks from the pushed commit, then `main` moves on. Returns (fork, main tip).
+
+    Leaves `main` checked out: the shape of reviewing someone's branch with `--to feature`.
+    """
+    assert GIT is not None
+    fork = backend(repo).resolve("HEAD").commit_id
+    run([GIT, "checkout", "-q", "-b", "feature"], cwd=repo.root)
+    repo.write("src/feature.py", "z: int = 3\n")
+    commit(repo, "feature work")
+    run([GIT, "checkout", "-q", "main"], cwd=repo.root)
+    repo.write("src/mainline.py", "w: int = 4\n")
+    commit(repo, "mainline work")
+    run([GIT, "push", "-q", "origin", "main"], cwd=repo.root)
+    return fork, backend(repo).resolve("main").commit_id
+
+
+def test_fork_point_is_computed_against_the_target(git_repo: Repo) -> None:
+    """On main, `-b main --to feature` must use feature's fork point, not main's tip."""
+    git = backend(git_repo)
+    fork, main_tip = diverge(git_repo)
+    assert git.fork_point(git.resolve("main"), git.resolve("feature")).commit_id == fork
+    # Against the working copy (main itself) it is main's tip, as before.
+    assert git.fork_point(git.resolve("main")).commit_id == main_tip
+
+
+def test_default_base_is_computed_from_an_explicit_target(git_repo: Repo) -> None:
+    git = backend(git_repo)
+    fork, _ = diverge(git_repo)
+    assert git.default_base(git.resolve("feature")).commit_id == fork
+
+
+def test_a_pushed_explicit_target_is_not_its_own_base(git_repo: Repo) -> None:
+    """Every commit of `feature` is pushed, but comparing it with itself would show nothing."""
+    assert GIT is not None
+    git = backend(git_repo)
+    fork, _ = diverge(git_repo)
+    run([GIT, "push", "-q", "origin", "feature"], cwd=git_repo.root)
+    assert git.default_base(git.resolve("feature")).commit_id == fork
+
+
+def colleague_pushes_to_main(repo: Repo, short_tmp_path: Path) -> str:
+    """Someone else pushes a commit to main. Returns its id."""
+    assert GIT is not None
+    other = short_tmp_path / "colleague"
+    remote = str(repo.root.parent / "remote.git")
+    run([GIT, "clone", "-q", "--branch", "main", remote, str(other)], cwd=short_tmp_path)
+    run([GIT, "config", "user.email", "c@example.com"], cwd=other)
+    run([GIT, "config", "user.name", "Colleague"], cwd=other)
+    (other / "src" / "colleague.py").write_text("c: int = 5\n", encoding="utf-8")
+    run([GIT, "add", "-A"], cwd=other)
+    run([GIT, "commit", "-q", "-m", "colleague work"], cwd=other)
+    run([GIT, "push", "-q", "origin", "main"], cwd=other)
+    return run([GIT, "rev-parse", "HEAD"], cwd=other).stdout.strip()
+
+
+def test_base_prefers_a_newer_upstream_over_a_stale_local_branch(
+    git_repo: Repo, short_tmp_path: Path
+) -> None:
+    """Branching from origin/main and never fast-forwarding local main is the norm.
+
+    Local main's fork point is then older than the real one, and the colleague's commit in
+    between used to show up as the user's own NEW and FIXED errors.
+    """
+    assert GIT is not None
+    stale = backend(git_repo).resolve("main").commit_id
+    pushed = colleague_pushes_to_main(git_repo, short_tmp_path)
+    run([GIT, "fetch", "-q"], cwd=git_repo.root)
+    run([GIT, "checkout", "-q", "-b", "feature", "origin/main"], cwd=git_repo.root)
+    git_repo.write("src/feature.py", "z: int = 3\n")
+    commit(git_repo, "feature work")
+
+    git = backend(git_repo)
+    target = git.working_copy()
+    assert git.resolve_base("main", target, tip=False).commit_id == pushed
+    assert any("is behind" in warning for warning in git.warnings)
+    # --tip still means the literal ref.
+    assert git.resolve_base("main", target, tip=True).commit_id == stale
+
+
+def test_a_remote_that_already_contains_the_branch_is_not_preferred(git_repo: Repo) -> None:
+    """The branch was pushed to the remote's main: its fork point there is the branch itself."""
+    assert GIT is not None
+    fork = backend(git_repo).resolve("HEAD").commit_id
+    run([GIT, "checkout", "-q", "-b", "feature"], cwd=git_repo.root)
+    git_repo.write("src/feature.py", "z: int = 3\n")
+    commit(git_repo, "feature work")
+    run([GIT, "push", "-q", "origin", "feature:main"], cwd=git_repo.root)
+
+    git = backend(git_repo)
+    assert git.resolve_base("main", git.working_copy(), tip=False).commit_id == fork
+    assert git.warnings == []
+
+
+# ------------------------------------------------------------------ shallow clones
+
+
+def shallow_clone(repo: Repo, short_tmp_path: Path, branch: str) -> GitBackend:
+    """What CI checks out: one commit of `branch`, plus one commit of main fetched on top."""
+    assert GIT is not None
+    remote = (repo.root.parent / "remote.git").as_uri()
+    clone = short_tmp_path / "ci"
+    run(
+        [GIT, "clone", "-q", "--depth", "1", "--branch", branch, remote, str(clone)],
+        cwd=short_tmp_path,
+    )
+    run(
+        [GIT, "fetch", "-q", "--depth", "1", "origin", "+refs/heads/main:refs/remotes/origin/main"],
+        cwd=clone,
+    )
+    return GitBackend(GIT, cwd=clone)
+
+
+def test_a_shallow_clone_without_the_fork_point_is_an_error(
+    git_repo: Repo, short_tmp_path: Path
+) -> None:
+    """Silently comparing against main's tip used to invert everything main did since."""
+    assert GIT is not None
+    diverge(git_repo)
+    run([GIT, "push", "-q", "origin", "feature"], cwd=git_repo.root)
+
+    git = shallow_clone(git_repo, short_tmp_path, "feature")
+    main = git.resolve("origin/main")
+    assert "grafted" not in main.refs
+    with pytest.raises(MypyDiffError, match="shallow clone"):
+        git.resolve_base("origin/main", git.working_copy(), tip=False)
+
+
+def test_a_shallow_merge_commit_forks_from_its_recorded_parent(
+    git_repo: Repo, short_tmp_path: Path
+) -> None:
+    """A pull-request checkout is a merge commit whose first parent is the base branch."""
+    assert GIT is not None
+    _, main_tip = diverge(git_repo)
+    run([GIT, "checkout", "-q", "-b", "pr-merge", "main"], cwd=git_repo.root)
+    run([GIT, "merge", "-q", "--no-ff", "-m", "merge feature", "feature"], cwd=git_repo.root)
+    run([GIT, "push", "-q", "origin", "pr-merge"], cwd=git_repo.root)
+
+    git = shallow_clone(git_repo, short_tmp_path, "pr-merge")
+    base = git.resolve_base("origin/main", git.working_copy(), tip=False)
+    assert base.commit_id == main_tip

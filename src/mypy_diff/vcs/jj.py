@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 import shutil
-import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
 from .. import MypyDiffError
 from ..models import RevisionInfo
-from .base import Runner, unique_worktree_name
+from .base import Runner, checkout_name, temporary_parent, unique_worktree_name
 
 # One call gets us both the ids and the metadata we display.
 _TEMPLATE = (
@@ -18,14 +17,16 @@ _TEMPLATE = (
     '++ bookmarks.join(",") ++ "\\t" ++ description.first_line() ++ "\\n"'
 )
 
-#: Tried in order; the first revset that resolves to anything wins.
+#: Tried in order; the first revset that resolves to anything wins. ``{ancestors}`` is ``::@``
+#: for the working copy, and the *proper* ancestors of the target otherwise — a pushed `--to X`
+#: would else be its own base and the diff would always be empty. ``{parent}`` is ``@-`` / ``X-``.
 _DEFAULT_BASE_REVSETS = (
-    # The nearest ancestor of @ that has been pushed to a remote — the common case.
-    "heads(::@ & remote_bookmarks())",
+    # The nearest ancestor that has been pushed to a remote — the common case.
+    "heads({ancestors} & remote_bookmarks())",
     # Nothing pushed yet: fall back to the nearest locally named ancestor.
-    "heads(::@ & (bookmarks() | tags()))",
+    "heads({ancestors} & (bookmarks() | tags()))",
     "present(trunk())",
-    "@-",
+    "{parent}",
 )
 
 _WORKSPACE_PREFIX = "mypy-diff-"
@@ -52,7 +53,10 @@ class JjBackend:
         self._jj = Runner(executable, cwd=cwd, verbose=verbose)
         self.verbose = verbose
         self._root: Path | None = None
+        #: Shown with --verbose only.
         self.notes: list[str] = []
+        #: Shown always: something about the comparison the user should know.
+        self.warnings: list[str] = []
 
     # ---------------------------------------------------------------- basics
 
@@ -131,8 +135,14 @@ class JjBackend:
             change_id=current.change_id,
         )
 
-    def default_base(self) -> RevisionInfo:
-        for revset in _DEFAULT_BASE_REVSETS:
+    def default_base(self, target: RevisionInfo | None = None) -> RevisionInfo:
+        """The latest pushed (or else named) ancestor of ``target``, default the working copy."""
+        if target is None or target.is_working_copy:
+            ancestors, parent = "::@", "@-"
+        else:
+            ancestors, parent = f"::({target.commit_id}-)", f"{target.commit_id}-"
+        for template in _DEFAULT_BASE_REVSETS:
+            revset = template.format(ancestors=ancestors, parent=parent)
             # `present(trunk())` resolves to the root commit in a repo without a trunk;
             # an empty tree would report every single error as new.
             found = [r for r in self._log(revset, check=False) if r.commit_id != _ROOT_COMMIT_ID]
@@ -142,14 +152,23 @@ class JjBackend:
                 return found[0]
         raise MypyDiffError(
             "Could not determine a base revision automatically.",
-            "@ has no pushed, named or parent ancestor.",
+            "The target has no pushed, named or parent ancestor.",
             "Pass one explicitly, e.g. `-b main`.",
         )
 
-    def fork_point(self, rev: RevisionInfo) -> RevisionInfo:
-        # fork_point(x) == heads(::x_1 & ... & ::x_N); when the bookmark is already an
-        # ancestor of @ this resolves to the bookmark itself, which is what we want.
-        found = self._log(f"fork_point({rev.commit_id} | @)", check=False)
+    def resolve_base(self, revspec: str, target: RevisionInfo, tip: bool) -> RevisionInfo:
+        """The base for ``-b REVSPEC``: its fork point with ``target``, or its tip with --tip."""
+        rev = self.resolve(revspec)
+        return rev if tip else self.fork_point(rev, target)
+
+    def fork_point(self, rev: RevisionInfo, target: RevisionInfo | None = None) -> RevisionInfo:
+        """The common ancestor of ``rev`` and ``target`` (default: the working copy, ``@``).
+
+        fork_point(x) == heads(::x_1 & ... & ::x_N); when ``rev`` is already an ancestor of the
+        target this resolves to ``rev`` itself, which is what we want.
+        """
+        other = "@" if target is None or target.is_working_copy else target.commit_id
+        found = self._log(f"fork_point({rev.commit_id} | {other})", check=False)
         return found[0] if found else rev
 
     # ------------------------------------------------------------- materials
@@ -158,8 +177,9 @@ class JjBackend:
     def worktree(self, rev: RevisionInfo) -> Iterator[Path]:
         """Add a temporary jj workspace at ``rev``, always forgotten and removed on exit."""
         self.cleanup_stale()
-        parent = Path(tempfile.mkdtemp(prefix="mypy-diff-"))
-        target = parent / "tree"
+        parent = temporary_parent()
+        # Named like the repository: see GitBackend.worktree.
+        target = parent / checkout_name(self.root())
         workspace = unique_worktree_name(_WORKSPACE_PREFIX.rstrip("-"))
         try:
             # `-r` supplies the *parents* of the new working-copy commit, so the checked-out

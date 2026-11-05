@@ -7,10 +7,12 @@ stubs and would report a flood of spurious import/attribute errors.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -86,19 +88,53 @@ def split_command(raw: str) -> tuple[str, ...]:
     return tuple(shlex.split(stripped))
 
 
+def anchor_command(command: tuple[str, ...], project: Path) -> tuple[str, ...]:
+    """Pin a user-supplied command to the working copy, so both revisions run the same mypy.
+
+    The base revision is checked with the temporary checkout as working directory, so anything
+    the command resolves relative to its working directory would resolve differently there:
+
+    * a relative executable (``.venv/bin/mypy``) would not exist at all;
+    * ``uv run mypy`` would discover the checkout's pyproject.toml and build a fresh environment
+      from the *base* revision's lock file — for a workspace member, often one without mypy.
+
+    So a relative path is made absolute against the current directory, where the user typed it,
+    and ``uv run`` is pointed at the working copy's project explicitly.
+    """
+    if not command:
+        return command
+    first, *rest = command
+    separators = tuple(sep for sep in (os.sep, os.altsep) if sep)
+    if any(sep in first for sep in separators) and not os.path.isabs(first):
+        first = os.path.abspath(first)
+    if (
+        Path(first).stem.lower() == "uv"
+        and rest[:1] == ["run"]
+        and not any(_names_project(argument) for argument in rest)
+    ):
+        rest = ["run", "--project", str(project), *rest[1:]]
+    return (first, *rest)
+
+
+def _names_project(argument: str) -> bool:
+    return argument in ("--project", "--directory") or argument.startswith(
+        ("--project=", "--directory=")
+    )
+
+
 def _mypy_candidates(
     project: Path, explicit: str | None, repo_root: Path | None = None
 ) -> list[tuple[tuple[str, ...], str]]:
     candidates: list[tuple[tuple[str, ...], str]] = []
 
     if explicit:
-        candidates.append((split_command(explicit), "--mypy-cmd"))
+        candidates.append((anchor_command(split_command(explicit), project), "--mypy-cmd"))
         # An explicit command is a promise; do not silently fall back past it.
         return candidates
 
     from_env = os.environ.get("MYPY_DIFF_MYPY")
     if from_env:
-        candidates.append((split_command(from_env), "$MYPY_DIFF_MYPY"))
+        candidates.append((anchor_command(split_command(from_env), project), "$MYPY_DIFF_MYPY"))
         return candidates
 
     active_venv = os.environ.get("VIRTUAL_ENV")
@@ -133,6 +169,7 @@ def run_mypy(
     mypy_args: tuple[str, ...],
     cache_dir: Path,
     prog: str = "mypy-diff",
+    what: str = "the working copy",
 ) -> MypyRun:
     """Run mypy inside ``workdir`` and parse its diagnostics.
 
@@ -140,26 +177,59 @@ def run_mypy(
     cache — and so neither of them touches the developer's own ``.mypy_cache``.
 
     ``prog`` only names the command in error hints, so they show the entry point the user
-    actually typed.
-    """
-    argv = [*mypy.command, *_FORCED_ARGS, f"--cache-dir={cache_dir}", *mypy_args]
-    completed = subprocess.run(
-        argv,
-        cwd=workdir,
-        capture_output=True,
-        check=False,
-        # mypy's JSON output is UTF-8 (type names and messages can carry any character).
-        # Decoding with the locale codepage would break on non-ASCII identifiers.
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        env={**os.environ, "MYPY_FORCE_COLOR": "0", "NO_COLOR": "1"},
-    )
+    actually typed; ``what`` names the revision, so a failure says which side it came from.
 
-    if completed.returncode >= 2:
-        raise _fatal_error(completed, prog)
+    Anything that is not a trustworthy, complete report raises instead of returning: an empty
+    result would be diffed — and possibly cached — as "this revision has no errors", which turns
+    every error of the other side into NEW or FIXED.
+    """
+    argv = [
+        *mypy.command,
+        *_FORCED_ARGS,
+        f"--cache-dir={cache_dir}",
+        *_with_non_interactive(mypy_args),
+    ]
+    try:
+        completed = subprocess.run(
+            argv,
+            cwd=workdir,
+            capture_output=True,
+            check=False,
+            # mypy must never wait for an answer: `--install-types` prompts on stdin.
+            stdin=subprocess.DEVNULL,
+            # mypy's JSON output is UTF-8 (type names and messages can carry any character).
+            # Decoding with the locale codepage would break on non-ASCII identifiers.
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env={**os.environ, "MYPY_FORCE_COLOR": "0", "NO_COLOR": "1"},
+        )
+    except OSError as failure:
+        raise MypyDiffError(
+            f"Could not run mypy on {what}: {failure.strerror or failure}.",
+            f"Command: {' '.join(mypy.command)}",
+        ) from failure
+
+    if completed.returncode not in (0, 1):
+        raise _fatal_error(completed, prog, what)
 
     messages, skipped = parse_json_output(completed.stdout, workdir)
+    if not messages and completed.stderr.strip():
+        # With --non-interactive mypy reports its diagnostics on stderr, not stdout.
+        from_stderr, _ = parse_json_output(completed.stderr, workdir)
+        if from_stderr:
+            messages = from_stderr
+
+    if completed.returncode == 1 and not messages:
+        # Exit code 1 means "found errors". Without a single parsed diagnostic the report is
+        # missing, not empty: a wrapper that could not find mypy (`poetry run mypy` in a fresh
+        # worktree), a mode that prints no JSON, a refused environment.
+        raise MypyDiffError(
+            f"mypy exited with code 1 on {what} but reported no diagnostics.",
+            *_output_lines(completed),
+            f"Command: {' '.join(argv)}",
+        )
+
     return MypyRun(
         messages=messages,
         returncode=completed.returncode,
@@ -169,16 +239,59 @@ def run_mypy(
     )
 
 
+#: Arguments after `--` that make mypy print something other than a report. Passing them through
+#: would turn two full runs into "No change in mypy errors."
+_INFORMATIONAL_ARGS = frozenset({"-h", "--help", "-V", "--version"})
+
+
+def check_mypy_args(mypy_args: tuple[str, ...], prog: str = "mypy-diff") -> None:
+    """Reject arguments that would make mypy skip the analysis."""
+    for argument in mypy_args:
+        if argument in _INFORMATIONAL_ARGS:
+            raise MypyDiffError(
+                f"`{argument}` after `--` goes to mypy, which would then print no report.",
+                f"For mypy-diff's own help run `{prog} --help`; for mypy's, run `mypy --help`.",
+            )
+
+
+def _with_non_interactive(mypy_args: tuple[str, ...]) -> tuple[str, ...]:
+    """`--install-types` asks for confirmation on stdin; there is nobody there to answer."""
+    if "--install-types" in mypy_args and "--non-interactive" not in mypy_args:
+        return (*mypy_args, "--non-interactive")
+    return mypy_args
+
+
+def _output_lines(completed: subprocess.CompletedProcess[str]) -> list[str]:
+    """Everything mypy printed, stderr first. Both streams: either may hold the explanation."""
+    return [
+        line.rstrip()
+        for stream in (completed.stderr, completed.stdout)
+        for line in (stream or "").splitlines()
+        if line.strip()
+    ]
+
+
 #: Ways mypy says "you did not tell me what to analyse". The first is what it actually prints
 #: for a bare invocation ("Missing target module, package, files, or command."); the others
 #: cover configs that name paths which do not exist.
 _NO_TARGET_MARKERS = ("missing target", "cannot read file", "no files")
 
 
-def _fatal_error(completed: subprocess.CompletedProcess[str], prog: str) -> MypyDiffError:
-    details = [
-        line for line in (completed.stderr or completed.stdout).strip().splitlines() if line.strip()
-    ]
+def _fatal_error(
+    completed: subprocess.CompletedProcess[str], prog: str, what: str = "the working copy"
+) -> MypyDiffError:
+    if completed.returncode < 0:
+        try:
+            name = signal.Signals(-completed.returncode).name
+        except ValueError:
+            name = f"signal {-completed.returncode}"
+        return MypyDiffError(
+            f"mypy was killed by {name} while checking {what}.",
+            *(["It most likely ran out of memory."] if name == "SIGKILL" else []),
+            *_output_lines(completed),
+        )
+
+    details = _output_lines(completed)
 
     if any(marker in line.lower() for line in details for marker in _NO_TARGET_MARKERS):
         # mypy answers this one with a full usage dump, which buries the actual problem.
@@ -196,7 +309,22 @@ def _fatal_error(completed: subprocess.CompletedProcess[str], prog: str) -> Mypy
             '    files = ["src", "tests"]',
         )
 
-    return MypyDiffError(f"mypy failed with exit code {completed.returncode}.", *details)
+    # A blocking error (a syntax error, a duplicate module) arrives as JSON on stdout. Show it
+    # the way mypy would print it, not as a raw JSON object.
+    rendered = [_render_line(line) for line in details]
+    return MypyDiffError(f"mypy failed with exit code {completed.returncode} on {what}.", *rendered)
+
+
+def _render_line(line: str) -> str:
+    try:
+        raw = json.loads(line)
+    except json.JSONDecodeError:
+        return line
+    if not isinstance(raw, dict) or "message" not in raw:
+        return line
+    position = f"{raw.get('file') or '?'}:{raw.get('line') or 0}"
+    code = f"  [{raw['code']}]" if raw.get("code") else ""
+    return f"{position}: {raw.get('severity') or 'error'}: {raw['message']}{code}"
 
 
 def parse_json_output(stdout: str, workdir: Path) -> tuple[tuple[MypyMessage, ...], int]:
@@ -288,3 +416,114 @@ def _normalize_path(raw: str, workdir: Path) -> str:
                 # Different drive on Windows — nothing sensible to relativize against.
                 return path.as_posix()
     return path.as_posix()
+
+
+# ------------------------------------------------------------------ environment fingerprint
+
+#: Printed by mypy's own interpreter: everything installed there decides how imports resolve —
+#: dependencies, stub packages, plugins — and the Python version is mypy's default target.
+_FINGERPRINT_SCRIPT = (
+    "import importlib.metadata as m, json, sys\n"
+    "print(json.dumps({"
+    "'python': list(sys.version_info[:3]), 'prefix': sys.prefix, 'path': sys.path, "
+    "'dists': sorted(str(d.metadata['Name']) + '==' + str(d.version) for d in m.distributions())"
+    "}))"
+)
+
+#: Where mypy looks for a user-level config when the project has none (mypy/defaults.py).
+_USER_CONFIG_FILES = ("~/.config/mypy/config", "~/.mypy.ini")
+
+
+def environment_fingerprint(mypy: ToolInfo, project: Path) -> str:
+    """A digest of everything outside the revision that changes what mypy reports.
+
+    The result cache stores a base revision's diagnostics. They stay valid only as long as mypy
+    would still produce them: after installing a stub package or upgrading a dependency, the
+    cached base and a freshly checked target disagree, and pre-existing errors come out NEW.
+    Folding this digest into the cache key turns such a change into a cache miss instead.
+
+    Best effort: when the interpreter cannot be asked, the digest still covers the command and
+    the version, so it never fails a run.
+    """
+    parts: dict[str, object] = {
+        "command": list(mypy.command),
+        "version": mypy.raw_version,
+        "environment": _interpreter_report(mypy.command, project),
+        "MYPYPATH": os.environ.get("MYPYPATH", ""),
+        "user_config": _user_config_digest(),
+    }
+    payload = json.dumps(parts, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _interpreter_command(command: tuple[str, ...]) -> tuple[str, ...] | None:
+    """Turn the command that runs mypy into one that runs Python in the same environment."""
+    if not command:
+        return None
+    if len(command) >= 3 and command[-2:] == ("-m", "mypy"):
+        # `python -m mypy`, `uv run python -m mypy`.
+        return (*command[:-2], "-c", _FINGERPRINT_SCRIPT)
+    executable = Path(command[-1])
+    if executable.stem.lower() != "mypy":
+        return None
+    if len(command) > 1:
+        # A launcher such as `uv run mypy` or `poetry run mypy`: same launcher, other program.
+        return (*command[:-1], "python", "-c", _FINGERPRINT_SCRIPT)
+    # A script in an environment's bin/ (Scripts/ on Windows) sits next to its interpreter.
+    for name in ("python.exe", "python") if sys.platform == "win32" else ("python", "python3"):
+        interpreter = executable.parent / name
+        if interpreter.is_file():
+            return (str(interpreter), "-c", _FINGERPRINT_SCRIPT)
+    shebang = _shebang(executable)
+    if shebang:
+        return (*shebang, "-c", _FINGERPRINT_SCRIPT)
+    return None
+
+
+def _shebang(executable: Path) -> tuple[str, ...]:
+    try:
+        with executable.open("rb") as handle:
+            first = handle.readline(1024)
+    except OSError:
+        return ()
+    if not first.startswith(b"#!"):
+        return ()
+    return tuple(first[2:].decode("utf-8", errors="replace").split())
+
+
+def _interpreter_report(command: tuple[str, ...], project: Path) -> str:
+    probe_command = _interpreter_command(command)
+    if probe_command is None:
+        return ""
+    try:
+        completed = subprocess.run(
+            probe_command,
+            cwd=project,
+            capture_output=True,
+            check=False,
+            stdin=subprocess.DEVNULL,
+            timeout=60,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if completed.returncode != 0:
+        return ""
+    return completed.stdout.strip()
+
+
+def _user_config_digest() -> str:
+    digest = hashlib.sha256()
+    candidates = list(_USER_CONFIG_FILES)
+    if os.environ.get("XDG_CONFIG_HOME"):
+        candidates.insert(0, os.path.join(os.environ["XDG_CONFIG_HOME"], "mypy/config"))
+    for candidate in candidates:
+        path = Path(os.path.expanduser(candidate))
+        try:
+            digest.update(path.read_bytes())
+        except OSError:
+            continue
+        digest.update(str(path).encode("utf-8"))
+    return digest.hexdigest()
