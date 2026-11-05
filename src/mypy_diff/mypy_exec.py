@@ -87,15 +87,22 @@ def resolve_mypy(
     explicit: str | None = None,
     repo_root: Path | None = None,
     configured: str | None = None,
+    configured_in: Path | None = None,
 ) -> tuple[ToolInfo, str]:
     """Find a usable mypy. Returns the tool and a human-readable description of how.
+
+    ``configured_in`` is the directory of the file ``configured`` comes from: a relative
+    executable there, such as ``.venv/bin/mypy``, is relative to that file, wherever mypy-diff
+    is run from.
 
     Order: --mypy-cmd, $MYPY_DIFF_MYPY, ``mypy-cmd`` in [tool.mypy-diff] (``configured``), the
     active virtualenv, the project's .venv, `uv run --project`, the repository root's .venv
     (when the project lives in a subdirectory), then PATH. The variable beats the file: it is
     how one machine — a CI runner — overrides what the team set.
     """
-    for command, source in _mypy_candidates(project, explicit, repo_root, configured):
+    for command, source in _mypy_candidates(
+        project, explicit, repo_root, configured, configured_in
+    ):
         tool = probe("mypy", command)
         if tool is not None:
             return require("mypy", tool, MIN_MYPY), source
@@ -129,7 +136,9 @@ def split_command(raw: str) -> tuple[str, ...]:
     return tuple(shlex.split(stripped))
 
 
-def anchor_command(command: tuple[str, ...], project: Path) -> tuple[str, ...]:
+def anchor_command(
+    command: tuple[str, ...], project: Path, relative_to: Path | None = None
+) -> tuple[str, ...]:
     """Pin a user-supplied command to the working copy, so both revisions run the same mypy.
 
     The base revision is checked with the temporary checkout as working directory, so anything
@@ -139,15 +148,16 @@ def anchor_command(command: tuple[str, ...], project: Path) -> tuple[str, ...]:
     * ``uv run mypy`` would discover the checkout's pyproject.toml and build a fresh environment
       from the *base* revision's lock file — for a workspace member, often one without mypy.
 
-    So a relative path is made absolute against the current directory, where the user typed it,
-    and ``uv run`` is pointed at the working copy's project explicitly.
+    So a relative path is made absolute against the current directory, where the user typed it
+    (or against ``relative_to``, the directory of the file it was written in), and ``uv run`` is
+    pointed at the working copy's project explicitly.
     """
     if not command:
         return command
     first, *rest = command
     separators = tuple(sep for sep in (os.sep, os.altsep) if sep)
     if any(sep in first for sep in separators) and not os.path.isabs(first):
-        first = os.path.abspath(first)
+        first = os.path.abspath(first if relative_to is None else os.path.join(relative_to, first))
     if (
         Path(first).stem.lower() == "uv"
         and rest[:1] == ["run"]
@@ -168,6 +178,7 @@ def _mypy_candidates(
     explicit: str | None,
     repo_root: Path | None = None,
     configured: str | None = None,
+    configured_in: Path | None = None,
 ) -> list[tuple[tuple[str, ...], str]]:
     candidates: list[tuple[tuple[str, ...], str]] = []
 
@@ -182,7 +193,7 @@ def _mypy_candidates(
         return candidates
 
     if configured:
-        command = anchor_command(split_command(configured), project)
+        command = anchor_command(split_command(configured), project, configured_in)
         candidates.append((command, "mypy-cmd in [tool.mypy-diff]"))
         return candidates
 
@@ -301,6 +312,11 @@ VALUE_OPTIONS = frozenset(
 )
 #: Options whose value *is* a target: a module, a package, a program.
 _TARGET_OPTIONS = frozenset({"-m", "--module", "-p", "--package", "-c", "--command"})
+
+
+def names_targets(arguments: Iterable[str]) -> bool:
+    """Whether mypy arguments name something to check: a path, a module or a package."""
+    return _names_targets(list(arguments))
 
 
 def _names_targets(arguments: list[str]) -> bool:
