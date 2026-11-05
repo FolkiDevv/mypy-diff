@@ -182,14 +182,17 @@ def test_staged_with_a_conflict_in_the_index_is_an_error(git_repo: Repo) -> None
     assert GIT is not None
     git = backend(git_repo)
 
-    def feed(argv: list[str], text: str) -> str:
-        return subprocess.run(
-            argv, cwd=git_repo.root, input=text, capture_output=True, text=True, check=True
-        ).stdout
+    def feed(argv: list[str], data: bytes) -> str:
+        # Bytes, not text: on Windows text mode would turn "\n" into "\r\n" on the way in.
+        completed = subprocess.run(
+            argv, cwd=git_repo.root, input=data, capture_output=True, check=True
+        )
+        return completed.stdout.decode("ascii")
 
-    blob = feed([GIT, "hash-object", "-w", "--stdin"], "a\n").strip()
+    blob = feed([GIT, "hash-object", "-w", "--stdin"], b"a\n").strip()
     # Stage 1 ("common ancestor") of an unresolved merge conflict.
-    feed([GIT, "update-index", "--index-info"], f"100644 {blob} 1\tsrc/conflict.py\n")
+    entry = f"100644 {blob} 1\tsrc/conflict.py\0".encode("ascii")
+    feed([GIT, "update-index", "-z", "--index-info"], entry)
 
     with pytest.raises(MypyDiffError, match="Could not read the staged changes"):
         git.staged()
