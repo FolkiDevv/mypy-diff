@@ -376,3 +376,26 @@ def test_gitlab_clamps_a_missing_line_to_the_first() -> None:
     whole_file = message(-1, "import", "Cannot find module")
     issue = json.loads(capture(dataclasses.replace(RESULT, new=(whole_file,)), OutputFormat.GITLAB))
     assert issue[0]["location"]["lines"]["begin"] == 1
+
+
+def test_sarif_escapes_file_paths_as_uris() -> None:
+    """`#` would start a fragment, `%` an escape; a space is not allowed in a URI at all."""
+    odd = dataclasses.replace(message(1, "misc", "Bad"), path="src/a b#c%d.py")
+    result = dataclasses.replace(RESULT, new=(odd,))
+    location = json.loads(capture(result, OutputFormat.SARIF))["runs"][0]["results"][0]
+    uri = location["locations"][0]["physicalLocation"]["artifactLocation"]["uri"]
+    assert uri == "src/a%20b%23c%25d.py"
+
+
+def test_identical_repeated_errors_get_their_own_fingerprints() -> None:
+    """mypy can report the very same diagnostic twice at one position."""
+    twice = dataclasses.replace(
+        RESULT, new=(message(3, "misc", "Bad"), message(3, "misc", "Bad")), unchanged=()
+    )
+    sarif = json.loads(capture(twice, OutputFormat.SARIF))["runs"][0]["results"]
+    gitlab = json.loads(capture(twice, OutputFormat.GITLAB))
+    assert len({r["partialFingerprints"]["mypyDiff/v1"] for r in sarif}) == 2
+    # And the very same two in both reports.
+    assert {r["partialFingerprints"]["mypyDiff/v1"] for r in sarif} == {
+        issue["fingerprint"] for issue in gitlab
+    }

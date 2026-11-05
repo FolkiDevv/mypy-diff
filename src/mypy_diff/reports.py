@@ -14,10 +14,11 @@ Review tools use it to follow one finding from report to report.
 from __future__ import annotations
 
 import hashlib
-from collections import Counter
+from collections import Counter, defaultdict
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import quote
 
 from . import __version__
 from .matching import normalise_message
@@ -42,22 +43,31 @@ class Entry:
     was: MypyMessage | None = None
 
 
-def fingerprints(messages: Iterable[MypyMessage]) -> dict[MypyMessage, str]:
+class Fingerprints:
     """A stable, unique fingerprint for each diagnostic of the target.
 
     Computed over *all* of the target's diagnostics, whatever a report then shows, so that one
     error keeps its fingerprint whether or not `--only` or `--show-unchanged` let its
     neighbours in.
+
+    mypy does repeat itself — the very same diagnostic, twice at one position — so equal
+    messages each get their own fingerprint, handed out in order by :meth:`take`.
     """
-    seen: Counter[tuple[str, str, str]] = Counter()
-    found: dict[MypyMessage, str] = {}
-    for message in sorted(messages, key=lambda m: (m.path, m.line, m.column or 0)):
-        identity = (message.path, message.code or "", normalise_message(message.message))
-        occurrence = seen[identity]
-        seen[identity] += 1
-        raw = "\0".join((*identity, str(occurrence)))
-        found[message] = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
-    return found
+
+    def __init__(self, messages: Iterable[MypyMessage]) -> None:
+        seen: Counter[tuple[str, str, str]] = Counter()
+        self._queues: defaultdict[MypyMessage, list[str]] = defaultdict(list)
+        for message in sorted(messages, key=lambda m: (m.path, m.line, m.column or 0)):
+            identity = (message.path, message.code or "", normalise_message(message.message))
+            occurrence = seen[identity]
+            seen[identity] += 1
+            raw = "\0".join((*identity, str(occurrence)))
+            self._queues[message].append(hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32])
+
+    def take(self, message: MypyMessage) -> str:
+        """The next unused fingerprint of ``message``; "" when it is not a target diagnostic."""
+        queue = self._queues.get(message)
+        return queue.pop(0) if queue else ""
 
 
 def target_messages(result: DiffResult) -> list[MypyMessage]:
@@ -82,7 +92,7 @@ def sarif(
     result: DiffResult, entries: Sequence[Entry], properties: dict[str, Any]
 ) -> dict[str, Any]:
     """A SARIF 2.1.0 log with one run. ``baselineState`` says new, updated or unchanged."""
-    marks = fingerprints(target_messages(result))
+    marks = Fingerprints(target_messages(result))
     rules = sorted({entry.message.code or _NO_CODE for entry in entries})
     run: dict[str, Any] = {
         "tool": {
@@ -95,7 +105,7 @@ def sarif(
                 ],
             }
         },
-        "results": [_sarif_result(entry, marks.get(entry.message, "")) for entry in entries],
+        "results": [_sarif_result(entry, marks.take(entry.message)) for entry in entries],
         "properties": properties,
     }
     if result.incomplete:
@@ -112,7 +122,10 @@ def sarif(
 
 def _sarif_result(entry: Entry, fingerprint: str) -> dict[str, Any]:
     message = entry.message
-    physical: dict[str, Any] = {"artifactLocation": {"uri": message.path, "uriBaseId": "%SRCROOT%"}}
+    # A URI reference, not a path: `#` would start a fragment, `%` an escape, and a space is
+    # not allowed at all.
+    uri = quote(message.path, safe="/")
+    physical: dict[str, Any] = {"artifactLocation": {"uri": uri, "uriBaseId": "%SRCROOT%"}}
     if message.line >= 1:
         region: dict[str, int] = {"startLine": message.line}
         if message.column is not None and message.column >= 0:
@@ -138,14 +151,14 @@ _GITLAB_SEVERITIES = {Severity.ERROR: "major", Severity.WARNING: "minor", Severi
 
 def gitlab(result: DiffResult, entries: Sequence[Entry]) -> list[dict[str, Any]]:
     """A GitLab Code Quality report: a JSON array of issues, each with a unique fingerprint."""
-    marks = fingerprints(target_messages(result))
+    marks = Fingerprints(target_messages(result))
     issues: list[dict[str, Any]] = []
     used: set[str] = set()
     for entry in entries:
         message = entry.message
-        fingerprint = marks.get(message) or _fallback_fingerprint(message)
-        # GitLab drops an issue whose fingerprint it has already seen in the report. Two equal
-        # diagnostics (mypy does repeat itself) must both stay.
+        fingerprint = marks.take(message) or _fallback_fingerprint(message)
+        # GitLab drops an issue whose fingerprint it has already seen in the report: never hand
+        # one out twice, even for a diagnostic that is not among the target's own.
         while fingerprint in used:
             fingerprint = hashlib.sha256(fingerprint.encode("ascii")).hexdigest()[:32]
         used.add(fingerprint)
