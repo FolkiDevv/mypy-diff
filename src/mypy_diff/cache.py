@@ -3,8 +3,9 @@
 Two separate things live under the same directory:
 
 * **Result cache** — the parsed diagnostics of one run, as ``<dir>/<sha256>.json``. Written for
-  any revision that resolves to a concrete commit; a commit is immutable, so the entry stays
-  valid forever. The dirty working copy is never cached.
+  any revision that resolves to a concrete commit. A commit is immutable, but the environment
+  mypy resolves imports in is not, so the key also carries a fingerprint of that environment.
+  The dirty working copy is never cached.
 * **Incremental mypy cache** — ``<dir>/mypy-cache/<commit16>[-wc]``, handed to mypy via
   ``--cache-dir``. One per run so the two runs never invalidate each other, and so the
   developer's own ``.mypy_cache`` is left alone. This is the part that takes real space
@@ -27,9 +28,10 @@ from pathlib import Path
 
 from platformdirs import user_cache_dir
 
+from . import __version__
 from .models import MypyMessage, RevisionInfo
 
-CACHE_VERSION = 3
+CACHE_VERSION = 4
 
 #: How many recent *runs* to keep. Overridable so CI can keep more, or nothing at all.
 KEEP_ENV_VAR = "MYPY_DIFF_CACHE_KEEP"
@@ -57,7 +59,7 @@ def keep_runs() -> int:
 
 
 class ResultCache:
-    """Maps (commit, mypy version, mypy args) to a list of diagnostics."""
+    """Maps (commit, mypy version, mypy args, environment) to a list of diagnostics."""
 
     def __init__(self, directory: Path | None, enabled: bool = True) -> None:
         self.directory = directory or default_cache_dir()
@@ -71,11 +73,16 @@ class ResultCache:
         mypy_version: str,
         mypy_args: tuple[str, ...],
         project: str = ".",
+        environment: str = "",
     ) -> str:
         """Cache key for one run.
 
         ``project`` is the directory mypy ran in, relative to the repository root: one commit
         of a monorepo holds several projects, each with its own config and its own results.
+
+        ``environment`` is :func:`mypy_exec.environment_fingerprint`: what is installed where mypy
+        resolves imports. A commit does not pin that, and a base result computed before a stub
+        package was installed would otherwise be compared with a target computed after it.
 
         The mypy configuration is deliberately *not* part of this. Cached runs always happen
         inside a worktree, where the config file comes from the commit itself — so
@@ -83,7 +90,15 @@ class ResultCache:
         false misses every time pyproject.toml is touched.
         """
         digest = hashlib.sha256()
-        parts = (str(CACHE_VERSION), commit_id, project, mypy_version, "\x00".join(mypy_args))
+        parts = (
+            str(CACHE_VERSION),
+            __version__,
+            commit_id,
+            project,
+            mypy_version,
+            "\x00".join(mypy_args),
+            environment,
+        )
         for part in parts:
             digest.update(part.encode("utf-8"))
             digest.update(b"\x1f")

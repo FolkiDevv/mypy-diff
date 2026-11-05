@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from mypy_diff.matching import build_line_map, diff_messages
+from mypy_diff.matching import build_line_map, diff_messages, normalise_message
 from mypy_diff.models import DiffResult, MypyMessage, RevisionInfo, Severity
 
 BASE = RevisionInfo(commit_id="a" * 40, short_id="aaaaaaaa")
@@ -195,3 +195,140 @@ def test_errors_in_different_files_never_match_each_other() -> None:
 def test_output_is_sorted_by_position() -> None:
     result = diff([], [message(line=30), message(line=10), message(line=20)])
     assert [m.line for m in result.new] == [10, 20, 30]
+
+
+# ------------------------------------------------------------------ unstable message text
+#
+# The texts below are the real shapes mypy prints. Each of them changes although the diagnostic
+# did not, and each used to come out as one bogus FIXED plus one bogus NEW.
+
+
+def test_normalise_message_masks_position_dependent_text() -> None:
+    assert normalise_message('Name "f" already defined on line 12') == (
+        'Name "f" already defined on line #'
+    )
+    assert normalise_message('variable has type "pkg.mod.C@9"') == 'variable has type "pkg.mod.C@#"'
+    assert normalise_message('"Job" has no attribute "statsu"; maybe "stats" or "status"?') == (
+        '"Job" has no attribute "statsu"'
+    )
+    assert normalise_message(
+        'Module has no attribute "proces"; maybe "process", "processes", or "proceed"?'
+    ) == ('Module has no attribute "proces"')
+    assert normalise_message('Name "resutl" is not defined; did you mean "result"?') == (
+        'Name "resutl" is not defined'
+    )
+
+
+def test_redefinition_pushed_down_by_an_insertion_stays_unchanged() -> None:
+    """`[no-redef]` names the line of the first definition, which moves with the insertion."""
+    base_text = "def f() -> None: ...\n\n\ndef f() -> None: ...\n"
+    target_text = "import os\n" + base_text
+    result = diff(
+        [message(line=4, code="no-redef", text='Name "f" already defined on line 1')],
+        [message(line=5, code="no-redef", text='Name "f" already defined on line 2')],
+        files={"src/app.py": (base_text, target_text)},
+    )
+    assert result.new == ()
+    assert result.fixed == ()
+    assert len(result.unchanged) == 1
+
+
+def test_redefinition_in_moved_code_stays_unchanged() -> None:
+    """Moved code has no line mapping; the content tier must still see through `on line N`."""
+    result = diff(
+        [message(line=9, code="no-redef", text='Name "f" already defined on line 1')],
+        [message(line=30, code="no-redef", text='Name "f" already defined on line 22')],
+    )
+    assert result.new == ()
+    assert len(result.unchanged) == 1
+
+
+def test_a_redefinition_of_another_name_is_still_new() -> None:
+    result = diff(
+        [message(line=9, code="no-redef", text='Name "f" already defined on line 1')],
+        [message(line=9, code="no-redef", text='Name "g" already defined on line 1')],
+    )
+    assert len(result.new) == 1
+    assert len(result.fixed) == 1
+
+
+def test_local_class_line_suffix_does_not_split_a_match() -> None:
+    base_text = "a\nb\nc\n"
+    target_text = "import os\n" + base_text
+    text = (
+        'Incompatible types in assignment (expression has type "b.C", variable has type "b.C@{}")'
+    )
+    result = diff(
+        [message(line=2, code="assignment", text=text.format(9))],
+        [message(line=3, code="assignment", text=text.format(10))],
+        files={"src/app.py": (base_text, target_text)},
+    )
+    assert result.new == ()
+    assert len(result.unchanged) == 1
+
+
+def test_a_longer_suggestion_list_does_not_make_an_error_new() -> None:
+    """Adding a similar name anywhere, even in another file, extends mypy's 'maybe' list."""
+    result = diff(
+        [message(code="attr-defined", text='"Job" has no attribute "statsu"; maybe "status"?')],
+        [
+            message(
+                code="attr-defined",
+                text='"Job" has no attribute "statsu"; maybe "stats" or "status"?',
+            )
+        ],
+    )
+    assert result.new == ()
+    assert len(result.unchanged) == 1
+
+
+def test_a_renumbered_argument_on_an_unedited_line_stays_unchanged() -> None:
+    """A parameter was added and its call site updated on another line: 'Argument 2' -> '3'."""
+    base_text = "g(\n    1,\n    'x',\n)\n"
+    target_text = "g(\n    0,\n    1,\n    'x',\n)\n"
+    result = diff(
+        [message(line=3, code="arg-type", text='Argument 2 to "g" has incompatible type "str"')],
+        [message(line=4, code="arg-type", text='Argument 3 to "g" has incompatible type "str"')],
+        files={"src/app.py": (base_text, target_text)},
+    )
+    assert result.new == ()
+    assert result.fixed == ()
+    assert len(result.unchanged) == 1
+
+
+def test_a_renumbered_list_item_on_an_unedited_line_stays_unchanged() -> None:
+    base_text = "xs: list[int] = [\n    'a',\n    1,\n]\n"
+    target_text = "xs: list[int] = [\n    0,\n    'a',\n    1,\n]\n"
+    result = diff(
+        [message(line=2, code="list-item", text='List item 0 has incompatible type "str"')],
+        [message(line=3, code="list-item", text='List item 1 has incompatible type "str"')],
+        files={"src/app.py": (base_text, target_text)},
+    )
+    assert result.new == ()
+    assert len(result.unchanged) == 1
+
+
+def test_indices_only_relax_the_match_on_an_unedited_line() -> None:
+    """Away from a pinned position, 'Argument 1' and 'Argument 2' are different errors."""
+    result = diff(
+        [message(line=3, code="arg-type", text='Argument 1 to "g" has incompatible type "str"')],
+        [message(line=40, code="arg-type", text='Argument 2 to "g" has incompatible type "str"')],
+    )
+    assert len(result.new) == 1
+    assert len(result.fixed) == 1
+
+
+def test_masked_indices_on_one_line_pair_by_column() -> None:
+    base_text = "a\ng('x', 'y')\n"
+    target_text = "import os\n" + base_text
+    base = [
+        message(line=2, column=2, code="arg-type", text='Argument 1 to "g" has type "str"'),
+        message(line=2, column=7, code="arg-type", text='Argument 2 to "g" has type "str"'),
+    ]
+    target = [
+        message(line=3, column=2, code="arg-type", text='Argument 1 to "g" has type "str"'),
+        message(line=3, column=7, code="arg-type", text='Argument 2 to "g" has type "str"'),
+    ]
+    result = diff(base, target, files={"src/app.py": (base_text, target_text)})
+    assert result.new == ()
+    assert len(result.unchanged) == 2

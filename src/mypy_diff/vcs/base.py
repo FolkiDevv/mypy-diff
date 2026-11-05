@@ -5,6 +5,7 @@ from __future__ import annotations
 import itertools
 import os
 import subprocess
+import tempfile
 from collections.abc import Iterator
 from contextlib import AbstractContextManager
 from pathlib import Path
@@ -25,6 +26,20 @@ class CommandError(MypyDiffError):
         self.argv = argv
         self.returncode = returncode
         self.stderr = stderr
+
+
+#: Variables git exports to hooks that must not leak into our own git calls. Inside a pre-commit
+#: hook GIT_INDEX_FILE names the index of the commit being made — with `git commit -a` a
+#: temporary one. `git worktree add` would then write the base revision's tree into it, and the
+#: commit would silently record that tree instead of the user's changes.
+_HOOK_VARIABLES = ("GIT_INDEX_FILE",)
+
+
+def subprocess_env() -> dict[str, str]:
+    """The environment for VCS subprocesses: machine-readable, locale-independent, hook-safe."""
+    env = {key: value for key, value in os.environ.items() if key not in _HOOK_VARIABLES}
+    env.update({"LC_ALL": "C", "NO_COLOR": "1"})
+    return env
 
 
 class Runner:
@@ -51,8 +66,7 @@ class Runner:
             text=True,
             encoding="utf-8",
             errors="replace",
-            # Force machine-readable, locale-independent output.
-            env={**os.environ, "LC_ALL": "C", "NO_COLOR": "1"},
+            env=subprocess_env(),
         )
         if check and completed.returncode != 0:
             raise CommandError(argv, completed.returncode, completed.stderr)
@@ -78,6 +92,10 @@ class VcsBackend(Protocol):
     """What the rest of mypy-diff needs from a version control system."""
 
     name: str
+    #: Things worth knowing about the comparison, shown with --verbose only.
+    notes: list[str]
+    #: Things the user must know about the comparison, shown on every run.
+    warnings: list[str]
 
     def root(self) -> Path:
         """Absolute path to the repository/workspace root."""
@@ -87,12 +105,20 @@ class VcsBackend(Protocol):
         """Turn a user-supplied revision (branch name, revset, SHA) into a concrete revision."""
         ...
 
-    def default_base(self) -> RevisionInfo:
-        """The latest named ancestor that has been pushed to git."""
+    def default_base(self, target: RevisionInfo | None = None) -> RevisionInfo:
+        """The latest named ancestor of ``target`` that has been pushed to git.
+
+        ``target`` defaults to the working copy. It matters: with ``--to X`` the base must be
+        derived from X, not from wherever the working copy happens to be.
+        """
         ...
 
-    def fork_point(self, rev: RevisionInfo) -> RevisionInfo:
-        """The common ancestor of ``rev`` and the current revision."""
+    def resolve_base(self, revspec: str, target: RevisionInfo, tip: bool) -> RevisionInfo:
+        """The base for ``-b REVSPEC``: its fork point with ``target``, or its tip with ``tip``."""
+        ...
+
+    def fork_point(self, rev: RevisionInfo, target: RevisionInfo | None = None) -> RevisionInfo:
+        """The common ancestor of ``rev`` and ``target`` (default: the working copy)."""
         ...
 
     def working_copy(self) -> RevisionInfo:
@@ -114,6 +140,21 @@ class VcsBackend(Protocol):
     def command_log(self) -> Iterator[str]:
         """Every VCS command this backend ran, for --verbose."""
         ...
+
+
+def temporary_parent() -> Path:
+    """A fresh directory to hold one temporary checkout.
+
+    Resolved, because mypy reports absolute paths through the *physical* working directory:
+    with a symlinked temp dir (macOS: /var -> /private/var) the paths would not relativise
+    against the unresolved name, and every error of the checkout would look new.
+    """
+    return Path(tempfile.mkdtemp(prefix="mypy-diff-")).resolve()
+
+
+def checkout_name(root: Path) -> str:
+    """Directory name for a checkout of ``root``: the same as the repository's own."""
+    return root.name or "tree"
 
 
 def unique_worktree_name(prefix: str = "mypy-diff") -> str:

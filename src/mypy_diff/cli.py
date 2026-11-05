@@ -9,7 +9,9 @@ factory and the two entry points only pick a backend.
 # to see `backend_type`, which is a closure variable of build_app().
 
 import dataclasses
+import os
 import sys
+import traceback
 from contextlib import ExitStack
 from pathlib import Path
 from typing import Annotated
@@ -22,7 +24,7 @@ from . import MypyDiffError, __version__
 from .cache import ResultCache
 from .matching import diff_messages
 from .models import DiffResult, MypyMessage, RevisionInfo
-from .mypy_exec import resolve_mypy, run_mypy
+from .mypy_exec import check_mypy_args, environment_fingerprint, resolve_mypy, run_mypy
 from .preflight import ToolInfo, find_tool, require_vcs
 from .progress import Activity
 from .project import Project, find_project
@@ -49,7 +51,15 @@ def build_app(backend_type: type[GitBackend] | type[JjBackend]) -> typer.Typer:
         ),
     )
 
-    @app.command(context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
+    @app.command(
+        context_settings={
+            "allow_extra_args": True,
+            "ignore_unknown_options": True,
+            # Without this, `-h` is an unknown option and goes to mypy, which prints its help
+            # instead of a report: two full runs that end in "No change in mypy errors."
+            "help_option_names": ["-h", "--help"],
+        }
+    )
     def main(
         ctx: typer.Context,
         base: Annotated[
@@ -141,6 +151,7 @@ def build_app(backend_type: type[GitBackend] | type[JjBackend]) -> typer.Typer:
             code = _run(
                 backend_type=backend_type,
                 console=console,
+                errors=errors,
                 # The indicator shares the stderr console so rich draws messages above the live
                 # region, and never touches stdout, which may be piped JSON.
                 activity=Activity(
@@ -173,6 +184,17 @@ def build_app(backend_type: type[GitBackend] | type[JjBackend]) -> typer.Typer:
         except KeyboardInterrupt:  # pragma: no cover - interactive only
             errors.print("[yellow]interrupted[/yellow]")
             raise typer.Exit(EXIT_FAILURE) from None
+        except Exception as failure:
+            # Exit code 1 means "new errors found", and that is what Python uses for an
+            # uncaught exception. A crash must never read as a verdict, so it is mapped to 2.
+            errors.print(
+                Text("error: ", style="bold red") + Text(f"mypy-diff crashed: {failure!r}")
+            )
+            if verbose:
+                errors.print(Text("".join(traceback.format_exception(failure))))
+            else:
+                errors.print(Text("  Run again with --verbose for the traceback."))
+            raise typer.Exit(EXIT_FAILURE) from failure
 
         if exit_zero:
             code = EXIT_OK
@@ -185,6 +207,7 @@ def _run(
     *,
     backend_type: type[GitBackend] | type[JjBackend],
     console: Console,
+    errors: Console,
     activity: Activity,
     mypy_args: tuple[str, ...],
     base: str | None,
@@ -201,6 +224,8 @@ def _run(
     doctor: bool,
     verbose: bool,
 ) -> int:
+    check_mypy_args(mypy_args, prog=f"mypy-diff-{backend_type.name}")
+
     with activity:
         activity.step("Checking tools")
         vcs_tool = _resolve_vcs(backend_type.name, skip_version_check)
@@ -219,19 +244,47 @@ def _run(
             _print_verbose_header(
                 console, backend, base_rev, target_rev, mypy, mypy_source, project
             )
+        for warning in backend.warnings:
+            errors.print(Text("warning: ", style="bold yellow") + Text(warning))
 
         cache = ResultCache(cache_dir, enabled=not no_cache)
+        environment = _Fingerprint(mypy, project.directory)
         base_messages = _messages_for(
-            backend, base_rev, mypy, mypy_args, cache, project, console, verbose, activity
+            backend,
+            base_rev,
+            mypy,
+            mypy_args,
+            cache,
+            environment,
+            project,
+            console,
+            verbose,
+            activity,
         )
         target_messages = _messages_for(
-            backend, target_rev, mypy, mypy_args, cache, project, console, verbose, activity
+            backend,
+            target_rev,
+            mypy,
+            mypy_args,
+            cache,
+            environment,
+            project,
+            console,
+            verbose,
+            activity,
         )
 
         activity.step("Comparing results")
         result = _diff(backend, base_rev, target_rev, base_messages, target_messages, project)
 
-    render(result, console, output_format, only, show_unchanged)
+    try:
+        render(result, console, output_format, only, show_unchanged)
+        console.file.flush()
+    except BrokenPipeError:
+        # The reader went away (`| head`). The verdict still stands; silence the rest so the
+        # interpreter does not fail again flushing stdout at exit.
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, sys.stdout.fileno())
 
     # Retention runs once the results are in hand, so a failed run never evicts anything.
     cache.prune()
@@ -270,16 +323,32 @@ def _resolve_vcs(name: str, skip_version_check: bool) -> ToolInfo:
 def _resolve_revisions(
     backend: VcsBackend, base: str | None, to: str | None, tip: bool
 ) -> tuple[RevisionInfo, RevisionInfo]:
+    """Resolve the target first: the base is always derived from it, never from HEAD/@."""
     target = backend.working_copy() if to is None else backend.resolve(to)
 
     if base is None:
         # The default base is the latest pushed named ancestor, which is already a fork point.
-        return backend.default_base(), target
+        return backend.default_base(target), target
 
-    resolved = backend.resolve(base)
-    if not tip:
-        resolved = backend.fork_point(resolved)
-    return resolved, target
+    return backend.resolve_base(base, target, tip), target
+
+
+class _Fingerprint:
+    """The environment fingerprint, computed on first use: it costs an interpreter start, and a
+    run whose revisions are all the working copy never needs it."""
+
+    def __init__(self, mypy: ToolInfo, project: Path) -> None:
+        self._mypy = mypy
+        self._project = project
+        self._computed = False
+        self._value: str | None = None
+
+    def get(self) -> str | None:
+        """The fingerprint, or None when the environment could not be inspected."""
+        if not self._computed:
+            self._value = environment_fingerprint(self._mypy, self._project)
+            self._computed = True
+        return self._value
 
 
 def _messages_for(
@@ -288,6 +357,7 @@ def _messages_for(
     mypy: ToolInfo,
     mypy_args: tuple[str, ...],
     cache: ResultCache,
+    environment: _Fingerprint,
     project: Project,
     console: Console,
     verbose: bool,
@@ -298,8 +368,18 @@ def _messages_for(
     activity.step(f"Checking {what}")
 
     cache_key: str | None = None
-    if not revision.is_working_copy:
-        cache_key = cache.key(revision.commit_id, mypy.display_version, mypy_args, project.subdir)
+    fingerprint = environment.get() if not revision.is_working_copy and cache.enabled else None
+    if not revision.is_working_copy and cache.enabled and fingerprint is None and verbose:
+        # Without knowing what is installed, a cached base could be from another environment.
+        console.print("[dim]result cache off: could not inspect mypy's environment[/dim]")
+    if fingerprint is not None:
+        cache_key = cache.key(
+            revision.commit_id,
+            mypy.display_version,
+            mypy_args,
+            project.subdir,
+            fingerprint,
+        )
         cached = cache.load(cache_key)
         if cached is not None:
             if verbose:
@@ -333,6 +413,9 @@ def _messages_for(
             mypy_args,
             cache.mypy_cache_dir(revision, stack, project.subdir),
             prog=f"mypy-diff-{backend.name}",
+            what="the working copy"
+            if revision.is_working_copy
+            else f"revision {revision.short_id}",
         )
 
     if verbose and run.skipped_lines:

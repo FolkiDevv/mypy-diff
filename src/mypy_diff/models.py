@@ -67,11 +67,6 @@ class MypyMessage:
         """Exact-match key: same file, same position, same diagnostic."""
         return (self.path, self.line, self.column, self.code or "", self.message)
 
-    @property
-    def content_key(self) -> tuple[str, str, str]:
-        """Position-independent key, used once line numbers stop matching."""
-        return (self.path, self.code or "", " ".join(self.message.split()))
-
     def format(self) -> str:
         """Render exactly the way mypy itself would, so output stays greppable."""
         position = f"{self.path}:{self.line}"
