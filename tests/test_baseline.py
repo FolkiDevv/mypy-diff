@@ -70,6 +70,15 @@ def test_a_working_copy_baseline_has_no_file_contents(tmp_path: Path) -> None:
     assert not loaded.as_base().is_working_copy
 
 
+def _baseline_with(**fields: object) -> str:
+    """A baseline whose one message has ``fields`` changed."""
+    entry = {**message("a.py", 1).to_json(), **fields}
+    revision = {"commit_id": "c" * 40, "short_id": "cccccccc"}
+    return json.dumps(
+        {"schema_version": 1, "mypy_version": "m", "revision": revision, "messages": [entry]}
+    )
+
+
 def test_a_missing_baseline_says_how_to_make_one(tmp_path: Path) -> None:
     with pytest.raises(MypyDiffError) as raised:
         read_baseline(tmp_path / "nope.json", prog="mypy-diff")
@@ -84,6 +93,11 @@ def test_a_missing_baseline_says_how_to_make_one(tmp_path: Path) -> None:
         ("[]", "has no schema_version"),
         ('{"schema_version": 1}', "is not a valid mypy-diff baseline"),
         ('{"schema_version": 99}', "schema version 99"),
+        # Valid JSON, but not what --write-baseline writes: rejected here, not mid-matching.
+        (_baseline_with(message=None), "is not a valid mypy-diff baseline"),
+        (_baseline_with(line="3"), "is not a valid mypy-diff baseline"),
+        (_baseline_with(line=True), "is not a valid mypy-diff baseline"),
+        (_baseline_with(notes=[1]), "is not a valid mypy-diff baseline"),
     ],
 )
 def test_a_bad_baseline_is_an_error(tmp_path: Path, content: str, expected: str) -> None:

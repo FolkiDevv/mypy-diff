@@ -1280,6 +1280,17 @@ def test_baseline_misuse_is_an_error(repo: Repo, args: list[str], expected: str)
     assert expected in result.stderr
 
 
+@pytest.mark.skipif(JJ is None, reason="jj is not installed")
+def test_recording_says_which_of_several_revisions_it_took(
+    jj_repo: Repo, short_tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(jj_repo.root)
+    baseline = str(short_tmp_path / "b.json")
+    result = invoke(jj_repo, "--write-baseline", baseline, "--to", "main | @", "--", "src")
+    assert result.exit_code == EXIT_OK, result.output
+    assert "resolves to 2 revisions" in result.stderr
+
+
 def test_a_baseline_target_that_does_not_exist_is_an_error(
     repo: Repo, short_tmp_path: Path
 ) -> None:

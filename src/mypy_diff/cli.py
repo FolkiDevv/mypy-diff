@@ -384,6 +384,9 @@ def _run(
         recorded: Baseline | None = None
         if record_baseline is not None:
             target_rev = backend.working_copy() if to is None else backend.resolve(to)
+            # Which revision is recorded matters: say so when `--to` matched several.
+            for warning in backend.warnings:
+                errors.print(Text("warning: ", style="bold yellow") + Text(warning))
             activity.step(f"Checking {_describe(target_rev)}")
             run = checked(revision=target_rev, role="target", activity=activity)
             _refuse_missing_targets(run, target_rev)

@@ -97,7 +97,10 @@ class MypyMessage:
 
     @classmethod
     def from_json(cls, raw: dict[str, Any]) -> Self:
-        return cls(
+        """The inverse of :meth:`to_json`. Raises ValueError (or KeyError, TypeError) on anything
+        :meth:`to_json` could not have written: a cache entry or baseline file that was edited
+        or truncated must be rejected here, not crash the matching later."""
+        message = cls(
             path=raw["path"],
             line=raw["line"],
             column=raw["column"],
@@ -107,6 +110,21 @@ class MypyMessage:
             hint=raw.get("hint", ""),
             notes=tuple(raw.get("notes", ())),
         )
+        if not (
+            isinstance(message.path, str)
+            and _is_int(message.line)
+            and (message.column is None or _is_int(message.column))
+            and isinstance(message.message, str)
+            and (message.code is None or isinstance(message.code, str))
+            and isinstance(message.hint, str)
+            and all(isinstance(note, str) for note in message.notes)
+        ):
+            raise ValueError(f"not a diagnostic: {raw!r}")
+        return message
+
+
+def _is_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
 
 
 @dataclass(frozen=True, slots=True)
