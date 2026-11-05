@@ -378,6 +378,16 @@ class TestEnvironmentFingerprint:
             "-c",
         )
 
+    def test_an_option_with_an_inline_path_named_mypy_is_not_the_program(self) -> None:
+        command = ("uv", "run", "--project=/tools/mypy", "mypy")
+        assert (_interpreter_command(command) or ())[:5] == (
+            "uv",
+            "run",
+            "--project=/tools/mypy",
+            "python",
+            "-c",
+        )
+
     def test_a_bare_name_is_looked_up_on_path(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

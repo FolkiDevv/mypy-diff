@@ -479,7 +479,9 @@ def _interpreter_command(command: tuple[str, ...]) -> tuple[str, ...] | None:
         (
             i
             for i, token in enumerate(command)
-            if Path(token).stem.lower() == "mypy"
+            # An option is never the program, not even `--project=/tools/mypy`.
+            if not token.startswith("-")
+            and Path(token).stem.lower() == "mypy"
             and (i == 0 or command[i - 1] not in _LAUNCHER_VALUE_OPTIONS)
         ),
         None,
