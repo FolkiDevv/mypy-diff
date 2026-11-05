@@ -133,6 +133,10 @@ class VcsBackend(Protocol):
         """Whether the working copy on disk differs from its commit (``working_copy()``)."""
         ...
 
+    def same_tree(self, base: RevisionInfo, target: RevisionInfo) -> bool:
+        """Whether ``target`` (possibly the working copy) holds exactly the files of ``base``."""
+        ...
+
     def is_shallow(self) -> bool:
         """Whether the repository is a shallow clone."""
         ...

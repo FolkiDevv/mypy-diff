@@ -243,6 +243,19 @@ class GitBackend:
         status = self._git.try_out("status", "--porcelain", "--untracked-files=normal")
         return status is None or bool(status)
 
+    def same_tree(self, base: RevisionInfo, target: RevisionInfo) -> bool:
+        """Same files: no uncommitted changes, and commits with one tree (an empty commit, a
+        revert of a revert)."""
+        if target.is_working_copy and self.has_uncommitted_changes():
+            return False
+        if base.commit_id == target.commit_id:
+            return True
+        trees = [
+            self._git.try_out("rev-parse", "-q", "--verify", f"{rev.commit_id}^{{tree}}")
+            for rev in (base, target)
+        ]
+        return trees[0] is not None and trees[0] == trees[1]
+
     def remote_branch(self, name: str) -> str:
         """How to name the remote-tracking copy of a branch, e.g. the CI's target branch."""
         return f"origin/{name}"

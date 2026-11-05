@@ -87,6 +87,21 @@ def test_working_copy_is_flagged_as_such(jj_repo: Repo) -> None:
     assert working.change_id
 
 
+def test_same_tree_of_a_fresh_empty_working_copy(jj_repo: Repo) -> None:
+    """A new, empty @ is another commit than its parent, with the very same files."""
+    jj = backend(jj_repo)
+    main = jj.resolve("main")
+    working = jj.working_copy()
+    assert working.commit_id != main.commit_id
+    assert jj.same_tree(main, working)
+
+
+def test_same_tree_sees_an_edit(jj_repo: Repo) -> None:
+    jj_repo.write("src/feature.py", "z: int = 3\n")
+    jj = backend(jj_repo)
+    assert not jj.same_tree(jj.resolve("main"), jj.working_copy())
+
+
 def test_file_at_reads_the_committed_content(jj_repo: Repo) -> None:
     jj = backend(jj_repo)
     jj_repo.write("src/clean.py", "COMPLETELY DIFFERENT\n")

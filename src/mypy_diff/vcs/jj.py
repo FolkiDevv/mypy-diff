@@ -200,6 +200,23 @@ class JjBackend:
         """Never: the up-front snapshot made @ exactly what is on disk."""
         return False
 
+    def same_tree(self, base: RevisionInfo, target: RevisionInfo) -> bool:
+        """Same files. The usual case is a fresh, empty @ on top of the base: another commit,
+        but nothing in it."""
+        if base.commit_id == target.commit_id:
+            return True
+        completed = self._jj.run(
+            "diff",
+            "--from",
+            base.commit_id,
+            "--to",
+            target.commit_id,
+            "--summary",
+            "--ignore-working-copy",
+            check=False,
+        )
+        return completed.returncode == 0 and not completed.stdout.strip()
+
     def remote_branch(self, name: str) -> str:
         """How to name the remote copy of a branch, e.g. the CI's target branch."""
         return f'remote_bookmarks(exact:"{name}", exact:"origin")'

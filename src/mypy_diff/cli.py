@@ -337,9 +337,9 @@ def _run(
                 errors.print(
                     Text("warning: ", style="bold yellow")
                     + Text(
-                        f"the base is the target itself ({base_rev.short_id}), with nothing "
-                        "uncommitted: there is nothing to compare. To compare against a "
-                        "branch, pass it with -b, e.g. -b origin/main."
+                        f"the target holds the same files as the base ({base_rev.short_id}): "
+                        "there is nothing to compare. To compare against a branch, pass it "
+                        "with -b, e.g. -b origin/main."
                     )
                 )
                 activity.step(f"Checking {_describe(target_rev)}")
@@ -413,9 +413,7 @@ def _run(
 
 def _same_tree(backend: VcsBackend, base: RevisionInfo, target: RevisionInfo) -> bool:
     """Whether base and target are the very same files, so one mypy run serves both."""
-    if base.commit_id != target.commit_id:
-        return False
-    return not (target.is_working_copy and backend.has_uncommitted_changes())
+    return backend.same_tree(base, target)
 
 
 def _runs_in_parallel(choice: bool | None, target: RevisionInfo) -> bool:

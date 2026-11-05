@@ -104,6 +104,27 @@ def test_working_copy_is_flagged_as_such(git_repo: Repo) -> None:
     assert working.commit_id == backend(git_repo).resolve("HEAD").commit_id
 
 
+def test_same_tree_needs_a_clean_working_copy(git_repo: Repo) -> None:
+    git = backend(git_repo)
+    head, working = git.resolve("HEAD"), git.working_copy()
+    assert git.same_tree(head, working)
+
+    git_repo.write("src/feature.py", "z: int = 3\n")
+    assert not git.same_tree(head, working)
+
+
+def test_same_tree_sees_through_an_empty_commit(git_repo: Repo) -> None:
+    assert GIT is not None
+    git = backend(git_repo)
+    main = git.resolve("main")
+    run([GIT, "commit", "-q", "--allow-empty", "-m", "nothing"], cwd=git_repo.root)
+
+    assert git.same_tree(main, git.resolve("HEAD"))
+    git_repo.write("src/feature.py", "z: int = 3\n")
+    commit(git_repo, "something")
+    assert not git.same_tree(main, git.resolve("HEAD"))
+
+
 def test_file_at_reads_the_committed_content(git_repo: Repo) -> None:
     git = backend(git_repo)
     head = git.resolve("HEAD")

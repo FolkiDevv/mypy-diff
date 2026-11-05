@@ -491,7 +491,7 @@ def test_an_unchanged_working_copy_is_checked_once(repo: Repo) -> None:
     """
     result = invoke(repo, "-v", "--", "src")
     assert result.exit_code == EXIT_OK, result.output
-    assert "the base is the target itself" in result.stderr
+    assert "the same files as the base" in result.stderr
     assert "checked out" not in result.stderr
     assert "1 unchanged error" in result.stdout
 
