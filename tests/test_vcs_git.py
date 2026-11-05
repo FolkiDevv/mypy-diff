@@ -160,6 +160,24 @@ def test_staged_reads_the_index_of_the_commit_being_made(
     assert backend(git_repo).file_at(staged, "src/hook.py") == "z: int = 3\n"
 
 
+def test_a_relative_index_path_is_relative_to_where_mypy_diff_runs(
+    git_repo: Repo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """git runs at the repository root; a path given from src/ must still mean the same file."""
+    assert GIT is not None
+    temporary = git_repo.root / ".git" / "next-index.lock"
+    env = {**os.environ, "GIT_INDEX_FILE": str(temporary)}
+    subprocess.run([GIT, "read-tree", "HEAD"], cwd=git_repo.root, env=env, check=True)
+    git_repo.write("src/hook.py", "z: int = 3\n")
+    subprocess.run([GIT, "add", "src/hook.py"], cwd=git_repo.root, env=env, check=True)
+    monkeypatch.chdir(git_repo.root / "src")
+    monkeypatch.setenv("GIT_INDEX_FILE", os.path.join("..", ".git", "next-index.lock"))
+
+    staged = backend(git_repo).staged()
+
+    assert backend(git_repo).file_at(staged, "src/hook.py") == "z: int = 3\n"
+
+
 def test_staged_with_a_conflict_in_the_index_is_an_error(git_repo: Repo) -> None:
     assert GIT is not None
     git = backend(git_repo)

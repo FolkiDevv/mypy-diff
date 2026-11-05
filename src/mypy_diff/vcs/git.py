@@ -246,6 +246,9 @@ class GitBackend:
         that index.
         """
         index = os.environ.get("GIT_INDEX_FILE")
+        if index:
+            # Relative to where mypy-diff was started; git here runs at the repository root.
+            index = os.path.abspath(index)
         completed = self._git.run(
             "write-tree", check=False, env={"GIT_INDEX_FILE": index} if index else None
         )

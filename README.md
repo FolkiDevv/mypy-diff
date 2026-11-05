@@ -197,7 +197,9 @@ hook a temporary index; `--staged` reads that one.
 The index becomes a commit of its own (on no branch, with a fixed identity, so the same index on
 the same `HEAD` always gets the same id and the caches hit) and is checked in a temporary
 worktree. `-b` still picks another base; `--to` and `--staged` exclude each other. jj has no index,
-so `mypy-diff-jj --staged` is an error.
+so `mypy-diff-jj --staged` is an error — and in a colocated repository `mypy-diff --staged` uses
+git, whose index is what a git commit records. The pre-commit hook runs on every commit, not only
+on commits that touch Python files: one that only tightens the mypy config can add errors too.
 
 A plain hook, `.git/hooks/pre-commit`:
 

@@ -374,6 +374,7 @@ def _run(
                 settings,
                 mypy_args,
                 args_from_settings,
+                staged=staged,
             )
             return EXIT_OK
 
@@ -1063,6 +1064,7 @@ def _print_doctor(
     settings: Settings,
     mypy_args: tuple[str, ...] = (),
     args_from_settings: bool = False,
+    staged: bool = False,
 ) -> None:
     """Everything a run would use, and what would go wrong with it — without running mypy."""
 
@@ -1105,7 +1107,7 @@ def _print_doctor(
     base, to, tip = revisions
     try:
         base_rev, target_rev, reason = _resolve_revisions(
-            backend, base, to, tip, configured=settings.base
+            backend, base, to, tip, configured=settings.base, staged=staged
         )
     except MypyDiffError as failure:
         row("base", f"cannot be determined: {failure.message}")
@@ -1156,20 +1158,26 @@ def git_main() -> None:
 
 def main() -> None:
     """`mypy-diff`: whichever of jj and git manages the current directory."""
-    build_app(detect_backend(Path.cwd()), prog="mypy-diff")()
+    arguments = sys.argv[1:]
+    own = arguments[: arguments.index("--")] if "--" in arguments else arguments
+    backend = detect_backend(Path.cwd(), needs_index="--staged" in own)
+    build_app(backend, prog="mypy-diff")()
 
 
-def detect_backend(start: Path) -> type[GitBackend] | type[JjBackend]:
+def detect_backend(start: Path, needs_index: bool = False) -> type[GitBackend] | type[JjBackend]:
     """The backend for the repository around ``start``: the nearest `.jj` or `.git` wins.
 
     A colocated repository has both, and jj is preferred there: it sees the working copy the
-    way the user works with it. Without jj installed git reads the same commits, so it is used
-    instead of failing; a `.jj` alone still selects jj, whose preflight then explains what is
-    missing. Outside any repository it is git, which says so.
+    way the user works with it — except for ``needs_index`` (`--staged`): only git has an index,
+    and in a git pre-commit hook it holds exactly what is being committed. Without jj installed
+    git reads the same commits, so it is used instead of failing; a `.jj` alone still selects
+    jj, whose preflight then explains what is missing. Outside any repository it is git, which
+    says so.
     """
     for directory in (start, *start.parents):
         if (directory / ".jj").is_dir():
-            if (directory / ".git").exists() and shutil.which("jj") is None:
+            colocated = (directory / ".git").exists()
+            if colocated and (needs_index or shutil.which("jj") is None):
                 return GitBackend
             return JjBackend
         if (directory / ".git").exists():
