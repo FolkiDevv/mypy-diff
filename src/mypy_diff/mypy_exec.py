@@ -750,27 +750,56 @@ def _inside(entry: str, root: Path) -> bool:
 def move_targets_into(
     arguments: tuple[str, ...], root: Path, checkout: Path, environment_prefix: str = ""
 ) -> tuple[str, ...]:
-    """Absolute targets into the working copy, moved to the same place in ``checkout``.
+    """Absolute paths into the working copy, moved to the same place in ``checkout``.
 
-    Only targets: an option's value (`--python-executable /repo/.venv/bin/python`,
-    `--config-file /repo/mypy.ini`) names something the checkout may not have, such as an
-    ignored virtualenv, and stays as it is. So does anything inside mypy's own environment.
+    Targets are moved, and so is `--config-file` when the checkout has that file: a revision is
+    checked with its own config, exactly as a relative `--config-file` would be. Any other
+    option's value (`--python-executable /repo/.venv/bin/python`) names something the checkout
+    may not have, such as an ignored virtualenv, and stays as it is. So does anything inside
+    mypy's own environment.
     """
     root = root.resolve()
     prefix = Path(environment_prefix).resolve() if environment_prefix else None
-    moved: list[str] = []
+
+    def movable(value: str) -> bool:
+        if not os.path.isabs(value):
+            return False
+        resolved = Path(value).resolve()
+        return resolved.is_relative_to(root) and not (
+            prefix is not None and resolved.is_relative_to(prefix)
+        )
+
+    def moved(value: str) -> str:
+        return str(checkout / Path(value).resolve().relative_to(root))
+
+    result: list[str] = []
     previous = ""
     for argument in arguments:
-        if (
-            os.path.isabs(argument)
-            and previous not in VALUE_OPTIONS
-            and Path(argument).resolve().is_relative_to(root)
-            and not (prefix is not None and Path(argument).resolve().is_relative_to(prefix))
-        ):
-            argument = str(checkout / Path(argument).resolve().relative_to(root))
-        moved.append(argument)
+        if previous == "--config-file":
+            if movable(argument) and Path(moved(argument)).is_file():
+                argument = moved(argument)
+        elif argument.startswith("--config-file="):
+            value = argument.partition("=")[2]
+            if movable(value) and Path(moved(value)).is_file():
+                argument = f"--config-file={moved(value)}"
+        elif previous not in VALUE_OPTIONS and movable(argument):
+            argument = moved(argument)
+        result.append(argument)
         previous = argument
-    return tuple(moved)
+    return tuple(result)
+
+
+def config_files(arguments: tuple[str, ...]) -> list[str]:
+    """The paths given to `--config-file`, in either spelling."""
+    found: list[str] = []
+    previous = ""
+    for argument in arguments:
+        if previous == "--config-file":
+            found.append(argument)
+        elif argument.startswith("--config-file="):
+            found.append(argument.partition("=")[2])
+        previous = argument
+    return found
 
 
 def working_copy_reads(

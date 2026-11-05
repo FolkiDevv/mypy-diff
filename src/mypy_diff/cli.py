@@ -10,6 +10,7 @@ factory and the two entry points only pick a backend.
 
 import dataclasses
 import functools
+import hashlib
 import os
 import re
 import sys
@@ -32,6 +33,7 @@ from .mypy_exec import (
     Environment,
     check_mypy_args,
     checkout_environment,
+    config_files,
     inspect_environment,
     move_targets_into,
     repository_import_dirs,
@@ -495,6 +497,34 @@ def _line_still_present(
     return bool(wanted) and any(line.strip() == wanted for line in current.splitlines())
 
 
+def _outside_config_digest(
+    mypy_args: tuple[str, ...], backend: VcsBackend, revision: RevisionInfo, project: Project
+) -> str:
+    """A digest of `--config-file`s the commit does not pin.
+
+    A config inside the repository that the revision has is taken from its checkout, so the
+    commit id already covers it. Any other — outside the repository, or not committed — is read
+    as it is now, and editing it must not hand back a base checked with the old settings.
+    """
+    root = project.root.resolve()
+    digest = hashlib.sha256()
+    for value in config_files(mypy_args):
+        path = (project.directory / value).resolve()
+        if path.is_relative_to(root) and not os.path.isabs(value):
+            continue  # relative: resolved inside the checkout, pinned by the commit
+        in_revision = path.is_relative_to(root) and (
+            backend.file_at(revision, path.relative_to(root).as_posix()) is not None
+        )
+        if in_revision:
+            continue  # moved into the checkout
+        try:
+            digest.update(path.read_bytes())
+        except OSError:
+            digest.update(b"<unreadable>")
+        digest.update(str(path).encode("utf-8"))
+    return digest.hexdigest()
+
+
 def _refuse_working_copy_reads(reads: list[Path], revision: RevisionInfo) -> None:
     """Refuse a result for a revision that was partly checked from the working copy.
 
@@ -541,7 +571,7 @@ def _messages_for(
             mypy.display_version,
             mypy_args,
             project.subdir,
-            fingerprint,
+            fingerprint + _outside_config_digest(mypy_args, backend, revision, project),
         )
         cached = cache.load_entry(cache_key)
         if cached is not None:

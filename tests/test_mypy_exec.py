@@ -24,6 +24,7 @@ from mypy_diff.mypy_exec import (
     anchor_command,
     check_mypy_args,
     checkout_environment,
+    config_files,
     environment_fingerprint,
     move_targets_into,
     repository_import_dirs,
@@ -584,3 +585,37 @@ class TestCheckoutOnlyReads:
         root, checkout = tmp_path / "repo", tmp_path / "checkout"
         stub = str(root / ".venv" / "lib" / "stubs" / "x.pyi")
         assert move_targets_into((stub,), root, checkout, str(root / ".venv")) == (stub,)
+
+
+class TestConfigFileInTheCheckout:
+    """A revision is checked with its own config, however `--config-file` was spelled."""
+
+    def test_a_repository_config_moves_into_the_checkout(self, tmp_path: Path) -> None:
+        root, checkout = tmp_path / "repo", tmp_path / "checkout"
+        (checkout).mkdir()
+        (checkout / "mypy.ini").write_text("[mypy]\n", encoding="utf-8")
+        config = str(root / "mypy.ini")
+        assert move_targets_into(("--config-file", config), root, checkout) == (
+            "--config-file",
+            str(checkout / "mypy.ini"),
+        )
+        assert move_targets_into((f"--config-file={config}",), root, checkout) == (
+            f"--config-file={checkout / 'mypy.ini'}",
+        )
+
+    def test_a_config_the_revision_lacks_stays_where_it_is(self, tmp_path: Path) -> None:
+        root, checkout = tmp_path / "repo", tmp_path / "checkout"
+        config = str(root / "local.ini")
+        arguments = ("--config-file", config)
+        assert move_targets_into(arguments, root, checkout) == arguments
+
+    def test_a_config_outside_the_repository_stays_where_it_is(self, tmp_path: Path) -> None:
+        root, checkout = tmp_path / "repo", tmp_path / "checkout"
+        arguments = ("--config-file", str(tmp_path / "shared" / "mypy.ini"))
+        assert move_targets_into(arguments, root, checkout) == arguments
+
+    def test_config_files_are_found_in_both_spellings(self) -> None:
+        assert config_files(("--config-file", "a.ini", "--config-file=b.ini", "src")) == [
+            "a.ini",
+            "b.ini",
+        ]

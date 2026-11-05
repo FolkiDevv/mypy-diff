@@ -817,6 +817,36 @@ def test_installed_packages_in_a_venv_inside_the_repository_are_fine(
     assert "2 unchanged errors" in result.output
 
 
+def test_an_absolute_config_file_is_the_revisions_own(repo: Repo) -> None:
+    """`--config-file /repo/mypy.ini` must mean what `--config-file mypy.ini` means: the base is
+    checked with the config of its own commit, not with today's."""
+    repo.write("mypy.ini", "[mypy]\npython_version = 3.12\n")
+    repo.write("src/untyped.py", "def legacy(x):\n    return x\n")
+    commit_as_main(repo, "a lenient config")
+    repo.write("mypy.ini", "[mypy]\npython_version = 3.12\ndisallow_untyped_defs = True\n")
+
+    relative = invoke(repo, "-b", "main", "--", "--config-file", "mypy.ini", "src")
+    absolute = invoke(repo, "-b", "main", "--", "--config-file", str(repo.root / "mypy.ini"), "src")
+
+    assert "+ NEW (1)" in relative.output, relative.output
+    assert "src/untyped.py:1" in relative.output
+    assert absolute.output == relative.output
+
+
+def test_an_outside_config_file_is_part_of_the_cache_key(repo: Repo, short_tmp_path: Path) -> None:
+    """A config outside the repository is read as it is now; editing it must not hand back a
+    base that was checked with the old settings."""
+    cache = short_tmp_path / "cache"
+    config = short_tmp_path / "shared.ini"
+    config.write_text("[mypy]\npython_version = 3.12\n", encoding="utf-8")
+    arguments = ("--", "--config-file", str(config), "src")
+    invoke(repo, *arguments, cache=cache)
+    assert "cache hit" in invoke(repo, "-v", *arguments, cache=cache).output
+
+    config.write_text("[mypy]\npython_version = 3.12\nstrict = True\n", encoding="utf-8")
+    assert "cache hit" not in invoke(repo, "-v", *arguments, cache=cache).output
+
+
 def test_an_absolute_target_is_checked_in_the_checkout(repo: Repo) -> None:
     """`-- $PWD/src` used to make the base check the working copy's files."""
     repo.write("src/legacy.py", "# padding\n" + repo.read("src/legacy.py"))
