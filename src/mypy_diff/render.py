@@ -14,6 +14,7 @@ from typing import Any
 from rich.console import Console
 from rich.text import Text
 
+from . import reports
 from .models import DiffResult, MypyMessage
 
 
@@ -22,6 +23,8 @@ class OutputFormat(StrEnum):
     PLAIN = "plain"
     JSON = "json"
     GITHUB = "github"
+    SARIF = "sarif"
+    GITLAB = "gitlab"
 
 
 class Only(StrEnum):
@@ -51,9 +54,18 @@ def render(
 ) -> None:
     match output_format:
         case OutputFormat.JSON:
-            # Straight to the stream, not through rich: whatever the environment says about
-            # colours, a consumer must get JSON and nothing else.
-            console.file.write(json.dumps(_as_json(result, only, show_unchanged), indent=2) + "\n")
+            _write_json(console, _as_json(result, only, show_unchanged))
+        case OutputFormat.SARIF:
+            properties = {
+                "base": {**_revision_json(result.base), "reason": result.base_reason or None},
+                "target": _revision_json(result.target),
+                "summary": _summary_counts(result),
+            }
+            entries = _report_entries(result, only, show_unchanged)
+            _write_json(console, reports.sarif(result, entries, properties))
+        case OutputFormat.GITLAB:
+            entries = _report_entries(result, only, show_unchanged)
+            _write_json(console, reports.gitlab(result, entries))
         case OutputFormat.GITHUB:
             _render_github(result, console, only)
         case _:
@@ -156,6 +168,34 @@ def _plural(count: int, word: str) -> str:
 # ------------------------------------------------------------------ machine output
 
 
+def _write_json(console: Console, payload: object) -> None:
+    """Straight to the stream, not through rich: whatever the environment says about colours,
+    a consumer must get JSON and nothing else."""
+    console.file.write(json.dumps(payload, indent=2) + "\n")
+
+
+def _report_entries(result: DiffResult, only: Only, show_unchanged: bool) -> list[reports.Entry]:
+    """What a code-review report lists: diagnostics of the target, so never the fixed ones."""
+    entries: list[reports.Entry] = []
+    if only in (Only.ALL, Only.NEW):
+        entries += [reports.Entry("new", message) for message in result.new]
+    if only is Only.ALL:
+        entries += [reports.Entry("changed", new, was=old) for old, new in result.changed]
+    if show_unchanged:
+        entries += [reports.Entry("unchanged", message) for message in result.unchanged]
+    return entries
+
+
+def _summary_counts(result: DiffResult) -> dict[str, int]:
+    return {
+        "new": len(result.new),
+        "fixed": len(result.fixed),
+        "changed": len(result.changed),
+        "unchanged": len(result.unchanged),
+        "net": len(result.new) - len(result.fixed),
+    }
+
+
 #: Bumped on any incompatible change to the JSON output.
 JSON_SCHEMA_VERSION = 1
 
@@ -170,13 +210,7 @@ def _as_json(result: DiffResult, only: Only, show_unchanged: bool = False) -> di
         "incomplete": result.incomplete or None,
         "base": {**_revision_json(result.base), "reason": result.base_reason or None},
         "target": _revision_json(result.target),
-        "summary": {
-            "new": len(result.new),
-            "fixed": len(result.fixed),
-            "changed": len(result.changed),
-            "unchanged": len(result.unchanged),
-            "net": len(result.new) - len(result.fixed),
-        },
+        "summary": _summary_counts(result),
         "stats": {
             "moved": result.stats.get("moved", 0),
             "moved_between_files": result.stats.get("moved_between_files", 0),

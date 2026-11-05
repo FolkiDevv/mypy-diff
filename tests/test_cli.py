@@ -316,6 +316,19 @@ def test_github_format_emits_annotations(repo: Repo) -> None:
     assert "::error file=src/clean.py,line=6" in result.output
 
 
+@pytest.mark.parametrize("output_format", ["sarif", "gitlab"])
+def test_report_formats_write_pure_json_and_log_the_verdict(repo: Repo, output_format: str) -> None:
+    """The report goes to a file the CI system picks up; the verdict to the job log."""
+    repo.write("src/clean.py", BROKEN_SOURCE)
+    result = invoke(repo, "--format", output_format, "--", "src")
+
+    assert result.exit_code == EXIT_NEW_ERRORS
+    report = json.loads(result.stdout)
+    issues = report["runs"][0]["results"] if output_format == "sarif" else report
+    assert len(issues) == 1
+    assert "1 new" in result.stderr
+
+
 def test_only_new_filters_the_output(repo: Repo) -> None:
     repo.write("src/legacy.py", "def broken() -> str:\n    return 'now correct'\n")
     result = invoke(repo, "--only", "new", "--", "src")

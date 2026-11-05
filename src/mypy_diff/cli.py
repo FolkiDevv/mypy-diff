@@ -424,7 +424,8 @@ def _run(
 
     if output_format is OutputFormat.GITHUB:
         _write_step_summary(result, errors)
-        # The annotations carry no verdict of their own; the log should.
+    if output_format in _REPORT_FORMATS:
+        # Annotations and report files carry no verdict of their own; the log should.
         errors.print(summary_text(result))
 
     try:
@@ -466,6 +467,9 @@ def _runs_in_parallel(choice: bool | None, target: RevisionInfo) -> bool:
         return choice
     return (os.cpu_count() or 1) >= _PARALLEL_MIN_CPUS
 
+
+#: Formats written for a CI system rather than a person: the verdict goes to the log as well.
+_REPORT_FORMATS = (OutputFormat.GITHUB, OutputFormat.SARIF, OutputFormat.GITLAB)
 
 #: Cores needed before both sides run at once by default.
 _PARALLEL_MIN_CPUS = 4

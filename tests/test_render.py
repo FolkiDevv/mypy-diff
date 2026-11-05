@@ -276,3 +276,103 @@ def test_step_summary_caps_long_lists() -> None:
         base=BASE, target=TARGET, new=tuple(message(n, "misc", f"e{n}") for n in range(1, 61))
     )
     assert "... and 10 more" in step_summary(many)
+
+
+# ------------------------------------------------------------------ SARIF
+
+
+def test_sarif_is_a_2_1_0_log_of_the_new_errors() -> None:
+    log = json.loads(capture(RESULT, OutputFormat.SARIF))
+    assert log["version"] == "2.1.0"
+    assert log["$schema"].endswith("sarif-2.1.0.json")
+    (run,) = log["runs"]
+    assert run["tool"]["driver"]["name"] == "mypy-diff"
+    assert [rule["id"] for rule in run["tool"]["driver"]["rules"]] == ["return-value"]
+
+    (result,) = run["results"]
+    assert result["ruleId"] == "return-value"
+    assert result["level"] == "error"
+    assert result["baselineState"] == "new"
+    assert result["message"]["text"] == "Bad return"
+    location = result["locations"][0]["physicalLocation"]
+    assert location["artifactLocation"] == {"uri": "src/app.py", "uriBaseId": "%SRCROOT%"}
+    # mypy's columns are 0-based; SARIF's are 1-based.
+    assert location["region"] == {"startLine": 42, "startColumn": 5}
+
+
+def test_sarif_never_lists_fixed_errors_but_counts_them() -> None:
+    """A fixed error's line is the base's: on the reviewed code it points at something else."""
+    run = json.loads(capture(RESULT, OutputFormat.SARIF, only=Only.FIXED))["runs"][0]
+    assert run["results"] == []
+    assert run["properties"]["summary"]["fixed"] == 1
+    assert run["properties"]["base"]["reason"] is None
+
+
+def test_sarif_marks_changed_and_unchanged_errors() -> None:
+    changed = json.loads(capture(CHANGED, OutputFormat.SARIF))["runs"][0]["results"]
+    assert [r["baselineState"] for r in changed] == ["updated"]
+    assert changed[0]["message"]["text"].endswith(
+        '\nwas: Argument 1 has type "str"; expected "int"'
+    )
+
+    listed = json.loads(capture(RESULT, OutputFormat.SARIF, show_unchanged=True))
+    states = [r["baselineState"] for r in listed["runs"][0]["results"]]
+    assert states == ["new", "unchanged", "unchanged"]
+
+
+def test_sarif_leaves_out_a_position_mypy_did_not_give() -> None:
+    whole_file = dataclasses.replace(message(-1, "import", "Cannot find module"), column=None)
+    result = dataclasses.replace(RESULT, new=(whole_file,))
+    location = json.loads(capture(result, OutputFormat.SARIF))["runs"][0]["results"][0]
+    assert "region" not in location["locations"][0]["physicalLocation"]
+
+
+def test_sarif_reports_an_incomplete_comparison() -> None:
+    partial = dataclasses.replace(RESULT, incomplete="mypy stopped at a blocking error")
+    run = json.loads(capture(partial, OutputFormat.SARIF))["runs"][0]
+    notification = run["invocations"][0]["toolExecutionNotifications"][0]
+    assert notification["message"]["text"] == "mypy stopped at a blocking error"
+
+
+# ------------------------------------------------------------------ GitLab Code Quality
+
+
+def test_gitlab_is_a_code_quality_report_of_the_new_errors() -> None:
+    (issue,) = json.loads(capture(RESULT, OutputFormat.GITLAB))
+    assert issue["check_name"] == "return-value"
+    assert issue["description"] == "Bad return"
+    assert issue["severity"] == "major"
+    assert issue["location"] == {"path": "src/app.py", "lines": {"begin": 42}}
+    assert len(issue["fingerprint"]) == 32
+
+
+def test_gitlab_fingerprints_survive_the_code_moving() -> None:
+    """One finding must keep its fingerprint when lines are added above it."""
+    moved = dataclasses.replace(RESULT, new=(message(57, "return-value", "Bad return"),))
+    before = json.loads(capture(RESULT, OutputFormat.GITLAB))[0]["fingerprint"]
+    after = json.loads(capture(moved, OutputFormat.GITLAB))[0]["fingerprint"]
+    assert before == after
+
+
+def test_gitlab_fingerprints_tell_repeated_errors_apart() -> None:
+    """GitLab drops an issue whose fingerprint it has already seen in the report."""
+    twice = dataclasses.replace(
+        RESULT,
+        new=(message(3, "return-value", "Bad return"), message(8, "return-value", "Bad return")),
+    )
+    issues = json.loads(capture(twice, OutputFormat.GITLAB))
+    assert len({issue["fingerprint"] for issue in issues}) == 2
+
+
+def test_gitlab_fingerprints_ignore_what_else_is_shown() -> None:
+    """--show-unchanged lets more issues in; the new error's fingerprint must not move."""
+    alone = json.loads(capture(RESULT, OutputFormat.GITLAB))[0]["fingerprint"]
+    listed = json.loads(capture(RESULT, OutputFormat.GITLAB, show_unchanged=True))
+    assert listed[0]["fingerprint"] == alone
+    assert len(listed) == 3
+
+
+def test_gitlab_clamps_a_missing_line_to_the_first() -> None:
+    whole_file = message(-1, "import", "Cannot find module")
+    issue = json.loads(capture(dataclasses.replace(RESULT, new=(whole_file,)), OutputFormat.GITLAB))
+    assert issue[0]["location"]["lines"]["begin"] == 1

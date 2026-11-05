@@ -192,7 +192,7 @@ the run fails.
   -b, --base REV         Base revision. Default: latest pushed named ancestor.
       --to REV           Target revision. Default: the working copy on disk.
       --tip              Use the tip of the -b branch instead of the fork point.
-      --format FMT       pretty | plain | json | github            [pretty]
+      --format FMT       pretty | plain | json | github | sarif | gitlab   [pretty]
       --only WHAT        new | fixed | all                         [all]
       --show-unchanged / --no-show-unchanged
                          List unchanged errors instead of counting them.
@@ -224,7 +224,7 @@ What a team passes on every run belongs in `pyproject.toml`:
 base = "origin/main"          # default for -b
 args = ["src", "tests"]       # mypy arguments when none are given after `--`
 mypy-cmd = "uv run mypy"      # default for --mypy-cmd
-format = "pretty"             # pretty | plain | json | github
+format = "pretty"             # pretty | plain | json | github | sarif | gitlab
 only = "all"                  # all | new | fixed
 show-unchanged = false
 fail-on-changed = false
@@ -297,6 +297,52 @@ stops with an error instead of silently comparing against the tip of `main`, whi
 everything `main` did since you branched as your change. The one shallow case that works is a
 pull-request merge commit checked against its own base branch: its first parent is recorded in
 the commit itself.
+
+### Code scanning and code quality reports
+
+`--format sarif` writes a [SARIF 2.1.0](https://docs.oasis-open.org/sarif/sarif/v2.1.0/) log for
+GitHub code scanning (or any SARIF viewer); `--format gitlab` a
+[Code Quality](https://docs.gitlab.com/ci/testing/code_quality/) report for GitLab merge requests.
+Both go to stdout, so redirect them to a file; the verdict goes to the log.
+
+```yaml
+# GitHub Actions
+- run: mypy-diff --format sarif -- src > mypy-diff.sarif
+- uses: github/codeql-action/upload-sarif@v4
+  if: always()
+  with:
+    sarif_file: mypy-diff.sarif
+```
+
+```yaml
+# GitLab CI
+mypy-diff:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+  variables:
+    GIT_DEPTH: "0"   # the fork point must be in the history
+  script:
+    - git fetch origin "$CI_MERGE_REQUEST_TARGET_BRANCH_NAME"
+    - mypy-diff -b "origin/$CI_MERGE_REQUEST_TARGET_BRANCH_NAME" --format gitlab -- src > gl-code-quality-report.json
+  artifacts:
+    when: always
+    reports:
+      codequality: gl-code-quality-report.json
+```
+
+Both reports describe the target, so every entry points into the code under review:
+
+- new errors are listed (SARIF `baselineState: "new"`), and so are changed ones with their old
+  wording (`"updated"`), unless `--only new` leaves them out;
+- unchanged errors only with `--show-unchanged` (`"unchanged"`);
+- fixed errors never: their line numbers belong to the base revision. SARIF counts them in the
+  run's `properties.summary`, next to the base and target revisions.
+
+Each entry has a fingerprint built from the file, the error code, the message with its
+position-dependent parts masked, and which occurrence of that diagnostic in the file it is — so
+an error keeps its fingerprint when the code around it moves, and two identical errors in one file
+still get two. In SARIF it is `partialFingerprints["mypyDiff/v1"]`; GitLab requires one per issue.
+Severities map to SARIF levels `error`/`warning`/`note` and GitLab `major`/`minor`/`info`.
 
 ### JSON output
 
