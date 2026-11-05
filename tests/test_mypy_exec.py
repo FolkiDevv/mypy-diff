@@ -291,6 +291,38 @@ class TestRunMypy:
         assert run.messages == ()
         assert run.dropped_targets == ("new.py",)
 
+    def test_an_existing_file_mypy_cannot_read_is_not_left_out(self, tmp_path: Path) -> None:
+        """Permission denied is a failure, not "this revision has no such file": leaving it out
+        would report its errors as FIXED."""
+        (tmp_path / "locked.py").write_text("", encoding="utf-8")
+        body = (
+            "print(\"mypy: error: Cannot read file 'locked.py': Permission denied\","
+            " file=sys.stderr)\nsys.exit(2)\n"
+        )
+        with pytest.raises(MypyDiffError, match="exit code 2") as caught:
+            run_fake(tmp_path, body, "locked.py")
+        assert not isinstance(caught.value, MissingTarget)
+
+    def test_reads_are_traced_from_the_verbose_log(self, tmp_path: Path) -> None:
+        log = (
+            "LOG:  Mypy Version:           2.3.0\n"
+            "LOG:  Parsing src/uses.py (uses)\n"
+            "LOG:  Metadata fresh for shared: file /work/lib/shared/__init__.py\n"
+            "LOG:  Parsing src/uses.py (uses)\n"
+        )
+        body = f"assert '--verbose' in sys.argv\nsys.stderr.write({log!r})\nsys.exit(0)\n"
+        run = run_mypy(
+            fake_mypy(tmp_path, body), tmp_path, (), tmp_path / "cache", trace_reads=True
+        )
+        assert run.read_files == ("src/uses.py", "/work/lib/shared/__init__.py")
+
+    def test_verbose_log_lines_stay_out_of_error_messages(self, tmp_path: Path) -> None:
+        body = "sys.stderr.write('LOG:  Parsing a.py (a)\\nplugin exploded\\n')\nsys.exit(2)\n"
+        with pytest.raises(MypyDiffError) as caught:
+            run_mypy(fake_mypy(tmp_path, body), tmp_path, (), tmp_path / "c", trace_reads=True)
+        assert "plugin exploded" in caught.value.details
+        assert not any(line.startswith("LOG:") for line in caught.value.details)
+
     def test_a_missing_path_named_only_by_the_config_is_an_error(self, tmp_path: Path) -> None:
         body = "print(\"mypy: error: Cannot read file 'gen': No such file\", file=sys.stderr)\n"
         with pytest.raises(MissingTarget, match="`gen` does not exist in base 1234"):

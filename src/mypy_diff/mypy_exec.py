@@ -47,6 +47,8 @@ class MypyRun:
     skipped_lines: int
     #: Targets after `--` that do not exist in this checkout and were left out.
     dropped_targets: tuple[str, ...] = ()
+    #: Every source file mypy read, as it logged them; only collected with ``trace_reads``.
+    read_files: tuple[str, ...] = ()
 
 
 class BlockingErrors(MypyDiffError):
@@ -205,6 +207,7 @@ def run_mypy(
     prog: str = "mypy-diff",
     what: str = "the working copy",
     env: dict[str, str] | None = None,
+    trace_reads: bool = False,
 ) -> MypyRun:
     """Run mypy inside ``workdir`` and parse its diagnostics.
 
@@ -228,7 +231,9 @@ def run_mypy(
     dropped: list[str] = []
     while True:
         try:
-            run = _run_once(mypy, workdir, tuple(remaining), cache_dir, prog, what, env or {})
+            run = _run_once(
+                mypy, workdir, tuple(remaining), cache_dir, prog, what, env or {}, trace_reads
+            )
         except MissingTarget as missing:
             position = _position_of(missing.path, remaining)
             if position is None:
@@ -305,10 +310,13 @@ def _run_once(
     prog: str,
     what: str,
     env: dict[str, str],
+    trace_reads: bool = False,
 ) -> MypyRun:
     argv = [
         *mypy.command,
         *_FORCED_ARGS,
+        # mypy logs every module it parses, or finds fresh in its cache, to stderr.
+        *(["--verbose"] if trace_reads else []),
         f"--cache-dir={cache_dir}",
         *_with_non_interactive(mypy_args),
     ]
@@ -359,7 +367,27 @@ def _run_once(
         stdout=completed.stdout,
         stderr=completed.stderr,
         skipped_lines=skipped,
+        read_files=_read_files(completed.stderr) if trace_reads else (),
     )
+
+
+#: The `--verbose` log lines that name a source file mypy read: parsed now, or loaded from its
+#: incremental cache after checking the file is unchanged.
+_READ_LOG = (
+    re.compile(r"^LOG:\s+Parsing (?P<path>.+) \([\w.]+\)$"),
+    re.compile(r"^LOG:\s+Metadata fresh\b.*?: file (?P<path>.+)$"),
+)
+
+
+def _read_files(stderr: str) -> tuple[str, ...]:
+    found: dict[str, None] = {}
+    for line in stderr.splitlines():
+        for pattern in _READ_LOG:
+            match = pattern.match(line.rstrip())
+            if match:
+                found[match["path"]] = None
+                break
+    return tuple(found)
 
 
 #: Arguments after `--` that make mypy print something other than a report. Passing them through
@@ -385,26 +413,26 @@ def _with_non_interactive(mypy_args: tuple[str, ...]) -> tuple[str, ...]:
 
 
 def _output_lines_of(stream: str | None) -> list[str]:
-    return [line.rstrip() for line in (stream or "").splitlines() if line.strip()]
+    return [
+        line.rstrip()
+        for line in (stream or "").splitlines()
+        if line.strip() and not line.startswith("LOG:")
+    ]
 
 
 def _output_lines(completed: subprocess.CompletedProcess[str]) -> list[str]:
-    """Everything mypy printed, stderr first. Both streams: either may hold the explanation."""
-    return [
-        line.rstrip()
-        for stream in (completed.stderr, completed.stdout)
-        for line in (stream or "").splitlines()
-        if line.strip()
-    ]
+    """Everything mypy printed, stderr first. Both streams: either may hold the explanation.
+
+    `--verbose` log lines are left out: they are for tracing reads, not for the user.
+    """
+    return [*_output_lines_of(completed.stderr), *_output_lines_of(completed.stdout)]
 
 
 #: How mypy says "you did not tell me what to analyse": a bare invocation, no targets configured.
 _NO_TARGET_MARKERS = ("missing target module, package, files, or command",)
-#: How mypy says a path it was asked to check does not exist (or holds no Python files).
-_MISSING_PATH = (
-    re.compile(r"Cannot read file '(?P<path>[^']+)'"),
-    re.compile(r"There are no \.py\[i\] files in directory '(?P<path>[^']+)'"),
-)
+#: How mypy says a path it was asked to check cannot be read, or holds no Python files.
+_CANNOT_READ = re.compile(r"Cannot read file '(?P<path>[^']+)'")
+_NO_PYTHON_FILES = re.compile(r"There are no \.py\[i\] files in directory '(?P<path>[^']+)'")
 
 
 def _fatal_error(
@@ -427,10 +455,15 @@ def _fatal_error(
     details = _output_lines(completed)
 
     for line in details:
-        for pattern in _MISSING_PATH:
-            missing = pattern.search(line)
-            if missing:
-                return MissingTarget(missing["path"], what)
+        empty = _NO_PYTHON_FILES.search(line)
+        if empty:
+            # A directory without Python files has no errors in this revision either.
+            return MissingTarget(empty["path"], what)
+        unreadable = _CANNOT_READ.search(line)
+        if unreadable and not (workdir or Path.cwd()).joinpath(unreadable["path"]).exists():
+            # Only an absent path is "not in this revision". One that exists but cannot be read
+            # (permissions) is a real failure: leaving it out would turn its errors into FIXED.
+            return MissingTarget(unreadable["path"], what)
 
     if any(marker in line.lower() for line in details for marker in _NO_TARGET_MARKERS):
         # mypy answers this one with a full usage dump, which buries the actual problem.

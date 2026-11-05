@@ -31,7 +31,9 @@ from platformdirs import user_cache_dir
 from . import __version__
 from .models import MypyMessage, RevisionInfo
 
-CACHE_VERSION = 4
+#: Bumped whenever a cached result may no longer be what this version would compute for the same
+#: key. 5: the base imports the repository's packages from its own checkout.
+CACHE_VERSION = 5
 
 #: How many recent *runs* to keep. Overridable so CI can keep more, or nothing at all.
 KEEP_ENV_VAR = "MYPY_DIFF_CACHE_KEEP"

@@ -261,15 +261,20 @@ def _match_across_files(
     """Tier 5: code that moved to another file, with its errors.
 
     A renamed module, or functions extracted into a new one, take their pre-existing errors
-    along. Per file those look fixed in one place and new in another. They pair up when the
-    error code and the text match *and* so does the source line the error sits on: that keeps
-    unrelated look-alike errors (two `return "x"` in different modules) apart.
+    along. Per file those look fixed in one place and new in another. They pair up only with
+    evidence that the code itself moved:
+
+    * the error code and the (normalised) text match, and so does the source line;
+    * that line left the old file (it occurs there fewer times than before) and arrived in the
+      new one (more times than before) — two untouched `return value` lines in different
+      modules, one fixed and one broken by the same change, are not a move;
+    * a neighbouring line moved along with it.
     """
     if not olds or not news:
         return [], list(olds), list(news)
 
-    base_lines = _LineReader(read_base_file)
-    target_lines = _LineReader(read_target_file)
+    base = _LineReader(read_base_file)
+    target = _LineReader(read_target_file)
 
     def key(message: MypyMessage, lines: _LineReader) -> tuple[str, str, str] | None:
         source = lines.get(message.path, message.line)
@@ -277,10 +282,19 @@ def _match_across_files(
             return None
         return (message.code or "", normalise_message(message.message), source)
 
+    def moved(old: MypyMessage, new: MypyMessage, source: str) -> bool:
+        left = base.count(old.path, source) > target.count(old.path, source)
+        arrived = target.count(new.path, source) > base.count(new.path, source)
+        if not (left and arrived):
+            return False
+        before = base.neighbours(old.path, old.line)
+        after = target.neighbours(new.path, new.line)
+        return any(a and a == b for a, b in zip(before, after, strict=True))
+
     index: dict[tuple[str, str, str], list[MypyMessage]] = defaultdict(list)
     unkeyed_new: list[MypyMessage] = []
     for message in news:
-        new_key = key(message, target_lines)
+        new_key = key(message, target)
         if new_key is None:
             unkeyed_new.append(message)
         else:
@@ -289,31 +303,45 @@ def _match_across_files(
     kept: list[MypyMessage] = []
     unmatched_old: list[MypyMessage] = []
     for old in olds:
-        old_key = key(old, base_lines)
-        match = None if old_key is None else _pop(index, old_key)
+        old_key = key(old, base)
+        bucket = index.get(old_key, []) if old_key is not None else []
+        match = next((new for new in bucket if old_key and moved(old, new, old_key[2])), None)
         if match is None:
             unmatched_old.append(old)
         else:
+            bucket.remove(match)
             kept.append(match)
 
     return kept, unmatched_old, unkeyed_new + _flatten(index)
 
 
 class _LineReader:
-    """Source lines by path and 1-based number, read once per file."""
+    """Source lines by path and 1-based number, whitespace-normalised, read once per file."""
 
     def __init__(self, read: Callable[[str], str | None]) -> None:
         self._read = read
         self._files: dict[str, list[str]] = {}
 
-    def get(self, path: str, line: int) -> str:
+    def _lines(self, path: str) -> list[str]:
         if path not in self._files:
             text = self._read(path)
-            self._files[path] = [] if text is None else text.splitlines()
-        lines = self._files[path]
-        if 1 <= line <= len(lines):
-            return " ".join(lines[line - 1].split())
-        return ""
+            lines = [] if text is None else text.splitlines()
+            self._files[path] = [" ".join(line.split()) for line in lines]
+        return self._files[path]
+
+    def get(self, path: str, line: int) -> str:
+        lines = self._lines(path)
+        return lines[line - 1] if 1 <= line <= len(lines) else ""
+
+    def count(self, path: str, source: str) -> int:
+        return self._lines(path).count(source)
+
+    def neighbours(self, path: str, line: int) -> tuple[str, str]:
+        """The nearest non-blank lines before and after ``line``, or "" at the file's edge."""
+        lines = self._lines(path)
+        before = next((text for text in reversed(lines[: max(line - 1, 0)]) if text), "")
+        after = next((text for text in lines[line:] if text), "")
+        return before, after
 
 
 def normalise_message(text: str) -> str:

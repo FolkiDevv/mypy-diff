@@ -493,8 +493,19 @@ def _line_still_present(
     return bool(wanted) and any(line.strip() == wanted for line in current.splitlines())
 
 
+def _into_checkout(arguments: tuple[str, ...], root: Path, checkout: Path) -> tuple[str, ...]:
+    """Absolute paths into the working copy, moved to the same place in the checkout."""
+    root = root.resolve()
+    moved: list[str] = []
+    for argument in arguments:
+        if os.path.isabs(argument) and Path(argument).resolve().is_relative_to(root):
+            argument = str(checkout / Path(argument).resolve().relative_to(root))
+        moved.append(argument)
+    return tuple(moved)
+
+
 def _check_checkout_was_used(
-    messages: Iterable[MypyMessage],
+    paths: Iterable[str],
     workdir: Path,
     checkout: Path,
     project: Project,
@@ -502,23 +513,24 @@ def _check_checkout_was_used(
 ) -> None:
     """Refuse a result for a revision that was partly checked from the working copy.
 
-    mypy reached files of the working copy from inside the checkout: an import path still
-    points there. The result would describe neither revision, and caching it would keep it.
+    mypy read files of the working copy while checking the checkout — whether or not they
+    produced errors: an import path still points there. The result would describe neither
+    revision, and caching it would keep it.
     """
     root = project.root.resolve()
     inside = checkout.resolve()
-    for message in messages:
-        if not message.path:
+    for path in paths:
+        if not path:
             continue
-        location = (workdir / message.path).resolve()
+        location = (workdir / path).resolve()
         if location.is_relative_to(root) and not location.is_relative_to(inside):
             raise MypyDiffError(
                 f"Checking {_describe(revision)} read files from your working copy, e.g. "
                 f"{location.relative_to(root).as_posix()}.",
-                "mypy found them through an import path that points into the working copy",
-                "(an editable install, PYTHONPATH or MYPYPATH), not into the checkout of that",
-                "revision, so its result would be wrong. Name the files to check instead, e.g.",
-                '    [tool.mypy]  files = ["src"]   (or: mypy_path = "src")',
+                "mypy found them through a path that points into the working copy, not into",
+                "the checkout of that revision, so its result would be wrong. Typically an",
+                "absolute `mypy_path` or `files` entry in the mypy config: make it relative to",
+                'the config instead, e.g.  mypy_path = "$MYPY_CONFIG_FILE_DIR/lib".',
             )
 
 
@@ -591,14 +603,18 @@ def _messages_for(
         run = run_mypy(
             mypy,
             workdir,
-            mypy_args,
+            mypy_args if checkout is None else _into_checkout(mypy_args, project.root, checkout),
             cache.mypy_cache_dir(revision, stack, project.subdir),
             prog=f"mypy-diff-{backend.name}",
             what=_describe(revision),
             env=run_env,
+            # Every file mypy reads for a checkout must come from that checkout; the log of
+            # reads is how a dependency that reports no errors gets checked too.
+            trace_reads=checkout is not None,
         )
         if checkout is not None:
-            _check_checkout_was_used(run.messages, workdir, checkout, project, revision)
+            read = [*run.read_files, *(message.path for message in run.messages)]
+            _check_checkout_was_used(read, workdir, checkout, project, revision)
 
     if verbose and run.skipped_lines:
         console.print(f"[dim]skipped {run.skipped_lines} non-JSON line(s) from mypy[/dim]")
@@ -607,9 +623,19 @@ def _messages_for(
             console.print(f"[dim]{path} does not exist in {what}: checked without it[/dim]")
 
     messages = tuple(_repo_paths(run.messages, project))
+    dropped = run.dropped_targets
+    if checkout is not None:
+        # Absolute targets were moved into the checkout; report them as the user wrote them.
+        prefix = str(checkout)
+        dropped = tuple(
+            str(project.root / Path(path).relative_to(prefix))
+            if os.path.isabs(path) and Path(path).is_relative_to(prefix)
+            else path
+            for path in dropped
+        )
     if cache_key is not None:
-        cache.store(cache_key, messages, run.dropped_targets)
-    return _Checked(messages, run.dropped_targets)
+        cache.store(cache_key, messages, dropped)
+    return _Checked(messages, dropped)
 
 
 def _diff(

@@ -454,3 +454,35 @@ def test_errors_moved_across_files_need_readable_sources() -> None:
     )
     assert len(result.new) == 1
     assert len(result.fixed) == 1
+
+
+def test_a_fixed_error_does_not_hide_a_look_alike_new_one_in_another_file() -> None:
+    """Both files keep their `return value` line: one function was fixed, another broken.
+
+    Same code, same text, same source line — but nothing moved, so the new error stays NEW.
+    """
+    a_before = "def a(value: str) -> int:\n    return value\n"
+    a_after = "def a(value: str) -> str:\n    return value\n"
+    b_before = "def b(value: str) -> str:\n    return value\n"
+    b_after = "def b(value: str) -> int:\n    return value\n"
+    result = diff(
+        [message(path="pkg/a.py", line=2, code="return-value", text=RETURN_ERROR)],
+        [message(path="pkg/b.py", line=2, code="return-value", text=RETURN_ERROR)],
+        files={"pkg/a.py": (a_before, a_after), "pkg/b.py": (b_before, b_after)},
+    )
+    assert len(result.new) == 1
+    assert len(result.fixed) == 1
+    assert result.unchanged == ()
+
+
+def test_a_moved_line_needs_a_neighbour_that_moved_with_it() -> None:
+    """The line left one file and arrived in another, but in unrelated surroundings."""
+    result = diff(
+        [message(path="pkg/old.py", line=2, code="return-value", text=RETURN_ERROR)],
+        [message(path="pkg/new.py", line=2, code="return-value", text=RETURN_ERROR)],
+        files={
+            "pkg/old.py": (LEGACY, None),
+            "pkg/new.py": (None, "def other(x: str) -> int:\n    return s.strip()\n"),
+        },
+    )
+    assert len(result.new) == 1

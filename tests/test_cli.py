@@ -760,17 +760,31 @@ def test_the_base_imports_from_its_own_checkout(
 
 
 def test_a_base_check_that_reads_the_working_copy_is_refused(repo: Repo) -> None:
-    """An absolute mypy_path in the config cannot be moved; the result must not be trusted."""
-    repo.write("lib/shared.py", "def value() -> int:\n    return 's'\n")
+    """An absolute mypy_path in the config cannot be moved; the result must not be trusted.
+
+    The dependency it reaches reports no errors of its own, so only the log of files mypy read
+    shows that the base saw the working copy's version of it.
+    """
+    repo.write("lib/shared.py", "def value() -> int:\n    return 1\n")
     repo.write("src/uses.py", USES_SHARED)
     config = repo.read("pyproject.toml")
     repo.write("pyproject.toml", config + f'mypy_path = "{(repo.root / "lib").as_posix()}"\n')
     commit_as_main(repo, "absolute mypy_path")
+    repo.write("lib/shared.py", "def value() -> str:\n    return 's'\n")
 
     result = invoke(repo, "-b", "main", "--", "src")
 
     assert result.exit_code == EXIT_FAILURE, result.output
     assert "read files from your working copy" in result.output
+    assert "lib/shared.py" in result.output
+
+
+def test_an_absolute_target_is_checked_in_the_checkout(repo: Repo) -> None:
+    """`-- $PWD/src` used to make the base check the working copy's files."""
+    repo.write("src/legacy.py", "# padding\n" + repo.read("src/legacy.py"))
+    result = invoke(repo, "--", str(repo.root / "src"))
+    assert result.exit_code == EXIT_OK, result.output
+    assert "1 unchanged error" in result.output
 
 
 @pytest.mark.skipif(GIT is None, reason="git is not installed")
