@@ -38,6 +38,7 @@ from .mypy_exec import (
     config_files,
     inspect_environment,
     move_targets_into,
+    names_targets,
     repository_import_dirs,
     resolve_mypy,
     run_mypy,
@@ -287,6 +288,7 @@ def _run(
                 backend,
                 ResultCache(cache_dir, enabled=not no_cache),
                 (base, to, tip),
+                mypy_args,
             )
             return EXIT_OK
 
@@ -412,8 +414,15 @@ def _run(
 
 
 def _same_tree(backend: VcsBackend, base: RevisionInfo, target: RevisionInfo) -> bool:
-    """Whether base and target are the very same files, so one mypy run serves both."""
-    return backend.same_tree(base, target)
+    """Whether base and target are the very same files, so one mypy run serves both.
+
+    Files the VCS ignores are on disk, and mypy checks them in the working copy, but no checkout
+    of the base has them — a generated module, say. Their errors are new as far as the base is
+    concerned; one run compared with itself would report them as unchanged.
+    """
+    if not backend.same_tree(base, target):
+        return False
+    return not (target.is_working_copy and backend.ignored_python_files(limit=1))
 
 
 def _runs_in_parallel(choice: bool | None, target: RevisionInfo) -> bool:
@@ -835,6 +844,7 @@ def _print_doctor(
     backend: VcsBackend,
     cache: ResultCache,
     revisions: tuple[str | None, str | None, bool],
+    mypy_args: tuple[str, ...] = (),
 ) -> None:
     """Everything a run would use, and what would go wrong with it — without running mypy."""
 
@@ -849,13 +859,25 @@ def _print_doctor(
     row("mypy found via", mypy_source)
     row("python", sys.version.split()[0])
 
-    config = mypy_config_file(project.directory, project.root)
-    if config is None:
-        row("mypy config", "none in the repository (mypy may use a user-level config)")
+    explicit = config_files(mypy_args)
+    config: Path | None
+    if explicit:
+        # mypy reads the last one given, relative to the directory it runs in.
+        named = (project.directory / explicit[-1]).resolve()
+        config = named if named.is_file() else None
+        how = "--config-file" if config is not None else "--config-file: no such file"
+        row("mypy config", f"{_display_path(named, project.root)}  ({how})")
     else:
-        row("mypy config", config.relative_to(project.root).as_posix())
-    targets = configured_targets(config) if config is not None else []
-    row("targets", ", ".join(targets) if targets else "none configured: pass them after `--`")
+        config = mypy_config_file(project.directory, project.root)
+        if config is None:
+            row("mypy config", "none in the repository (mypy may use a user-level config)")
+        else:
+            row("mypy config", config.relative_to(project.root).as_posix())
+    if names_targets(mypy_args):
+        row("targets", f"{' '.join(mypy_args)}  (after `--`)")
+    else:
+        targets = configured_targets(config) if config is not None else []
+        row("targets", ", ".join(targets) if targets else "none configured: pass them after `--`")
 
     base, to, tip = revisions
     try:
@@ -873,6 +895,14 @@ def _print_doctor(
 
     for warning in [*backend.warnings, *_environment_warnings(mypy_source, project)]:
         console.print(Text("  warning: ", style="bold yellow") + Text(warning))
+
+
+def _display_path(path: Path, root: Path) -> str:
+    """Repository-relative when inside the repository, absolute otherwise."""
+    try:
+        return path.relative_to(root.resolve()).as_posix()
+    except ValueError:
+        return str(path)
 
 
 def _environment_warnings(mypy_source: str, project: Project) -> list[str]:

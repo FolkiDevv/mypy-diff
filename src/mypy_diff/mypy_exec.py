@@ -291,6 +291,11 @@ VALUE_OPTIONS = frozenset(
 _TARGET_OPTIONS = frozenset({"-m", "--module", "-p", "--package", "-c", "--command"})
 
 
+def names_targets(arguments: Iterable[str]) -> bool:
+    """Whether mypy arguments name something to check: a path, a module or a package."""
+    return _names_targets(list(arguments))
+
+
 def _names_targets(arguments: list[str]) -> bool:
     """Whether mypy arguments still name something to check, after missing paths were dropped."""
     previous = ""

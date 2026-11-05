@@ -81,6 +81,18 @@ def test_doctor_shows_what_a_run_would_use(repo: Repo, short_tmp_path: Path) -> 
     assert str(short_tmp_path / "cache") in result.stdout
 
 
+def test_doctor_honours_an_explicit_config_file(repo: Repo) -> None:
+    """mypy reads the --config-file after `--`, not the one it would find by itself."""
+    repo.write("custom.ini", "[mypy]\nfiles = lib\n")
+    result = invoke(repo, "--doctor", "--", "--config-file", "custom.ini", "src")
+    assert "mypy config      custom.ini  (--config-file)" in result.stdout
+    assert "targets          --config-file custom.ini src  (after `--`)" in result.stdout
+
+    missing = invoke(repo, "--doctor", "--", "--config-file", "nope.ini")
+    assert "nope.ini  (--config-file: no such file)" in missing.stdout
+    assert "none configured: pass them after `--`" in missing.stdout
+
+
 def test_doctor_warns_about_a_foreign_virtualenv(
     repo: Repo, short_tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -494,6 +506,25 @@ def test_an_unchanged_working_copy_is_checked_once(repo: Repo) -> None:
     assert "the same files as the base" in result.stderr
     assert "checked out" not in result.stderr
     assert "1 unchanged error" in result.stdout
+
+
+def test_an_ignored_module_is_not_compared_with_itself(
+    git_repo: Repo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The tree is unchanged, but mypy checks a file the base checkout cannot have.
+
+    Taking one run for both would report its errors as unchanged, and pass.
+    """
+    monkeypatch.chdir(git_repo.root)
+    (git_repo.root / ".git" / "info").mkdir(parents=True, exist_ok=True)
+    (git_repo.root / ".git" / "info" / "exclude").write_text("generated.py\n", encoding="utf-8")
+    git_repo.write("src/generated.py", BROKEN_SOURCE)
+
+    result = invoke(git_repo, "--", "src")
+
+    assert result.exit_code == EXIT_NEW_ERRORS, result.output
+    assert "src/generated.py:6" in result.stdout
+    assert "the same files as the base" not in result.stderr
 
 
 @pytest.mark.parametrize("flag", ["--parallel", "--no-parallel"])
