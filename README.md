@@ -101,6 +101,14 @@ files = ["src", "tests"]
 …or you give them after `--`. With neither, mypy has nothing to analyse and the run stops with a
 message telling you so.
 
+A path after `--` that exists in only one of the two revisions — the file you just created, or
+one you deleted — is simply left out on the side that lacks it: it has no errors there. A path
+that exists in neither is reported as an error, so a typo cannot pass as "No change".
+
+A syntax error (or any other error mypy cannot analyse past) in the working copy is reported as
+**NEW**, with a note that nothing else could be compared. In the base revision it stops the run:
+pick another base, or leave the file out with `-- --exclude <path>`.
+
 Targets are deliberately not defaulted to `.`: the base revision is checked in a clean worktree
 while the target is your working copy, so `.` would drag `.venv` into one side only and report the
 whole virtualenv as new errors.
@@ -129,8 +137,8 @@ That is almost always the point you branched from, so the diff shows exactly you
 
 | | `mypy-diff-jj` | `mypy-diff-git` |
 |---|---|---|
-| default base | nearest ancestor of `@` with a remote bookmark | parent of your oldest unpushed commit |
-| falls back to | local bookmark or tag → `trunk()` → `@-` | `origin/HEAD` → `main`/`master` → `HEAD~1` |
+| default base | nearest ancestor of `@` reachable from a remote bookmark | parent of your oldest unpushed commit |
+| falls back to | local bookmark or tag below `@` → fork point with `trunk()` → `@-` | `origin/HEAD` → `main`/`master` → `HEAD~1` |
 | `-b NAME` accepts | a bookmark name or any revset | a branch, tag or any git revision |
 
 `-b NAME` compares against the **fork point** — the common ancestor of `NAME` and the target.
@@ -146,10 +154,22 @@ commit in between would be reported as yours. `-b <sha>` pins a commit exactly.
 The base is always derived from the **target**: with `--to feature`, both the fork point and the
 default base are computed from `feature`, not from whatever is checked out.
 
+**Merges.** After `git merge origin/main` into a branch you already pushed, your unpushed work
+builds on two pushed commits: your branch and main. Taking either one alone would report
+everything the other brought in as yours, so the default base is their merge, made on the fly
+(a commit on no branch, with fixed metadata so the cache recognises it). The same holds in the
+middle of a merge (`MERGE_HEAD`). If the two conflict, the base falls back to the fork point with
+the trunk and a warning says so.
+
+`mypy-diff-jj` snapshots the working copy once before resolving anything, so `@` is what is on
+disk, and a colocated repository's git refs are imported. When a revset matches several commits
+(a merge), the first is used and a warning lists them.
+
 **Target** (`--to`) defaults to the working copy *on disk*, including uncommitted changes. That
 run happens in place, so it is fast and reflects exactly what you are looking at. Any other
-revision is checked out into a temporary worktree (`jj workspace add` / `git worktree add`) that
-is always removed afterwards, even if the run fails.
+revision is checked out into a temporary worktree (`git worktree add`; for `mypy-diff-jj`, from
+jj's git store, so nothing lands in the operation log) that is always removed afterwards, even if
+the run fails.
 
 ### Options
 
@@ -167,6 +187,7 @@ is always removed afterwards, even if the run fails.
       --clean-cache      Delete the whole mypy-diff cache, then exit.
       --no-progress      Do not show the progress indicator.
       --exit-zero        Always exit 0, even when new errors appear.
+      --fail-on-changed  Also exit 1 when a pre-existing error changed its message.
       --skip-version-check
       --doctor           Print detected tools and versions, then exit.
   -v, --verbose          Show resolved revisions and every command run.
@@ -218,7 +239,8 @@ the commit itself.
 
 Comparing diagnostics by `(file, line, column, message)` is useless in practice — adding one
 import at the top of a file shifts every line below it, and every error in that file would be
-reported as simultaneously fixed and new. Matching therefore runs in three tiers, per file:
+reported as simultaneously fixed and new. Matching therefore runs in tiers, from strictest to
+loosest:
 
 1. **Exact** — same file, position and text.
 2. **Shifted** — the file's contents in both revisions are diffed with `difflib`, producing a
@@ -226,6 +248,13 @@ reported as simultaneously fixed and new. Matching therefore runs in three tiers
    were *themselves* edited get no mapping, so a real change is never hidden.
 3. **By content** — same file, same error code and message text, position ignored. Repeated
    diagnostics pair up in order of appearance.
+4. **Changed** — the same unedited line, column and error code, but different text: mypy now
+   infers another type there because code it depends on changed, often in another file. That is
+   one pre-existing error worded differently, shown as `~ CHANGED` with its old text. It does not
+   fail the run unless you pass `--fail-on-changed`.
+5. **Across files** — code that moved to another module (a renamed file, functions extracted
+   into a new one) takes its errors along. They match when the code, the text *and* the source
+   line the error sits on are the same, so unrelated look-alike errors stay apart.
 
 Tiers 2 and 3 compare a normalised message, because some of mypy's text depends on code that did
 not change: `already defined on line 12` and local classes such as `mod.C@12` carry line numbers,
@@ -256,6 +285,18 @@ First match wins, and `--doctor` tells you which one was used:
 Both revisions are always checked with the same mypy and the same arguments, and each revision
 gets its own incremental mypy cache — so the two runs never invalidate each other, and your own
 `.mypy_cache` is left untouched.
+
+### Packages from your own repository
+
+An editable install points at the working copy: `uv sync` installs every workspace member (and
+the project itself) that way, and an absolute `PYTHONPATH` does the same. Left alone, the base
+revision would import its sibling packages from your working copy — checked against your *new*
+code, a change that breaks it would come out "unchanged". So mypy-diff asks mypy's interpreter
+for its import path, and every entry inside the repository is taken from the base checkout
+instead (via `PYTHONPATH`, which mypy treats exactly like installed code). Absolute `MYPYPATH`
+entries into the working copy are moved the same way. If mypy still reads working-copy files
+while checking the base — an absolute `mypy_path` in the config, say — the run stops with an
+explanation instead of reporting a wrong result.
 
 ## Caching
 
@@ -323,13 +364,14 @@ VCS that is not installed skip themselves.
 
 ## Limitations
 
-- **Renamed files are not tracked.** An error in a file that was renamed shows up as one fixed
-  plus one new.
 - Notes (`note:` lines) are attached to their error and printed with it, but are not diffed on
   their own.
-- The base revision is checked out into a temporary worktree, which does not include your
-  virtualenv. Dependencies still resolve because mypy runs from your project's environment, but
-  a project relying on files that are *not* committed may report differently on the base side.
+- A file that was renamed *and* edited on the erroneous line shows up as one fixed plus one new:
+  moved errors are recognised by their unchanged source line.
+- The base revision is checked out into a clean temporary worktree, without files git ignores
+  (generated code such as `*_pb2.py` or `_version.py`) and without submodules. Imports of them
+  fail in the base only, so errors in code that uses them can come out NEW. mypy-diff warns when
+  it sees this: an import error that exists only in the base, on an import line you kept.
 
 ## License
 

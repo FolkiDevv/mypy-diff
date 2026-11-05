@@ -108,7 +108,12 @@ class DiffResult:
     new: tuple[MypyMessage, ...] = ()
     fixed: tuple[MypyMessage, ...] = ()
     unchanged: tuple[MypyMessage, ...] = ()
-    #: Messages skipped because they carry a severity we do not diff (currently notes).
+    #: Pre-existing errors whose text changed in place: (base message, target message).
+    changed: tuple[tuple[MypyMessage, MypyMessage], ...] = ()
+    #: Set when the comparison could not be done in full; says why. The lists are then partial.
+    incomplete: str = ""
+    #: Matching statistics: "moved" (unchanged errors that matched at another position),
+    #: "moved_between_files" (the subset that moved to another file).
     stats: dict[str, int] = field(default_factory=dict)
 
     @property

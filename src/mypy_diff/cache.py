@@ -108,26 +108,38 @@ class ResultCache:
         return self.directory / f"{key}.json"
 
     def load(self, key: str) -> tuple[MypyMessage, ...] | None:
+        entry = self.load_entry(key)
+        return None if entry is None else entry[0]
+
+    def load_entry(self, key: str) -> tuple[tuple[MypyMessage, ...], tuple[str, ...]] | None:
+        """The cached diagnostics, and the targets that run had to leave out (see run_mypy)."""
         if not self.enabled:
             return None
         path = self._path(key)
         try:
             raw = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
             return None
         try:
             messages = tuple(MypyMessage.from_json(item) for item in raw["messages"])
-        except (KeyError, TypeError, ValueError):
+            dropped = tuple(str(item) for item in raw.get("dropped", ()))
+        except (KeyError, TypeError, ValueError, AttributeError):
             # A cache entry written by an incompatible version: ignore and re-run.
             return None
         _touch(path)
-        return messages
+        return messages, dropped
 
-    def store(self, key: str, messages: tuple[MypyMessage, ...]) -> None:
+    def store(
+        self, key: str, messages: tuple[MypyMessage, ...], dropped: tuple[str, ...] = ()
+    ) -> None:
         if not self.enabled:
             return
         path = self._path(key)
-        payload = {"version": CACHE_VERSION, "messages": [m.to_json() for m in messages]}
+        payload = {
+            "version": CACHE_VERSION,
+            "messages": [m.to_json() for m in messages],
+            "dropped": list(dropped),
+        }
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             # Write-then-rename so a crash mid-write cannot leave a truncated entry behind.

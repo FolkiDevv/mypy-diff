@@ -9,9 +9,12 @@ factory and the two entry points only pick a backend.
 # to see `backend_type`, which is a closure variable of build_app().
 
 import dataclasses
+import functools
 import os
+import re
 import sys
 import traceback
+from collections.abc import Iterable
 from contextlib import ExitStack
 from pathlib import Path
 from typing import Annotated
@@ -24,7 +27,16 @@ from . import MypyDiffError, __version__
 from .cache import ResultCache
 from .matching import diff_messages
 from .models import DiffResult, MypyMessage, RevisionInfo
-from .mypy_exec import check_mypy_args, environment_fingerprint, resolve_mypy, run_mypy
+from .mypy_exec import (
+    BlockingErrors,
+    Environment,
+    check_mypy_args,
+    checkout_environment,
+    inspect_environment,
+    repository_import_dirs,
+    resolve_mypy,
+    run_mypy,
+)
 from .preflight import ToolInfo, find_tool, require_vcs
 from .progress import Activity
 from .project import Project, find_project
@@ -121,6 +133,16 @@ def build_app(backend_type: type[GitBackend] | type[JjBackend]) -> typer.Typer:
         exit_zero: Annotated[
             bool, typer.Option("--exit-zero", help="Always exit 0, even when new errors appear.")
         ] = False,
+        fail_on_changed: Annotated[
+            bool,
+            typer.Option(
+                "--fail-on-changed",
+                help=(
+                    "Also exit 1 when a pre-existing error changed its message in place "
+                    "(shown as CHANGED)."
+                ),
+            ),
+        ] = False,
         skip_version_check: Annotated[
             bool, typer.Option("--skip-version-check", help="Do not enforce minimum tool versions.")
         ] = False,
@@ -173,6 +195,7 @@ def build_app(backend_type: type[GitBackend] | type[JjBackend]) -> typer.Typer:
                 skip_version_check=skip_version_check,
                 doctor=doctor,
                 verbose=verbose,
+                fail_on_changed=fail_on_changed,
             )
         except MypyDiffError as failure:
             # Text(), not markup strings: messages quote mypy output and config snippets, and
@@ -223,6 +246,7 @@ def _run(
     skip_version_check: bool,
     doctor: bool,
     verbose: bool,
+    fail_on_changed: bool = False,
 ) -> int:
     check_mypy_args(mypy_args, prog=f"mypy-diff-{backend_type.name}")
 
@@ -248,34 +272,57 @@ def _run(
             errors.print(Text("warning: ", style="bold yellow") + Text(warning))
 
         cache = ResultCache(cache_dir, enabled=not no_cache)
-        environment = _Fingerprint(mypy, project.directory)
-        base_messages = _messages_for(
-            backend,
-            base_rev,
-            mypy,
-            mypy_args,
-            cache,
-            environment,
-            project,
-            console,
-            verbose,
-            activity,
+        environment = _EnvironmentProbe(mypy, project.directory)
+        checked = functools.partial(
+            _messages_for,
+            backend=backend,
+            mypy=mypy,
+            mypy_args=mypy_args,
+            cache=cache,
+            environment=environment,
+            project=project,
+            console=console,
+            verbose=verbose,
+            activity=activity,
         )
-        target_messages = _messages_for(
-            backend,
-            target_rev,
-            mypy,
-            mypy_args,
-            cache,
-            environment,
-            project,
-            console,
-            verbose,
-            activity,
-        )
+        try:
+            base_run = checked(revision=base_rev)
+        except BlockingErrors as blocked:
+            raise MypyDiffError(
+                blocked.message,
+                *blocked.details,
+                "",
+                "mypy cannot analyse the base revision past this error, so there is nothing to",
+                "compare against. Pick another base with -b, or leave the file out:",
+                "    -- --exclude <path> <targets>",
+            ) from blocked
 
-        activity.step("Comparing results")
-        result = _diff(backend, base_rev, target_rev, base_messages, target_messages, project)
+        try:
+            target_run = checked(revision=target_rev)
+        except BlockingErrors as blocked:
+            # mypy reports nothing else once it hits a blocking error, so there is no full
+            # report to diff. The blocking errors themselves are the news, though: report them
+            # as NEW (and fail), instead of aborting without a single annotation.
+            result = DiffResult(
+                base=base_rev,
+                target=target_rev,
+                new=tuple(_repo_paths(blocked.messages, project)),
+                incomplete=(
+                    f"mypy stopped at a blocking error in {_describe(target_rev)}; "
+                    "nothing else could be compared."
+                ),
+            )
+        else:
+            _check_targets_exist(base_run, target_run, base_rev, target_rev)
+            activity.step("Comparing results")
+            result = _diff(
+                backend, base_rev, target_rev, base_run.messages, target_run.messages, project
+            )
+
+    if target_rev.is_working_copy:
+        hint = _asymmetry_warning(backend, result, project)
+        if hint:
+            errors.print(Text("warning: ", style="bold yellow") + Text(hint))
 
     try:
         render(result, console, output_format, only, show_unchanged)
@@ -293,7 +340,9 @@ def _run(
         for note in backend.notes:
             console.print(f"[dim]note: {note}[/dim]")
 
-    return EXIT_NEW_ERRORS if result.has_new else EXIT_OK
+    if result.has_new or (fail_on_changed and result.changed):
+        return EXIT_NEW_ERRORS
+    return EXIT_OK
 
 
 def _clean_cache(console: Console, cache_dir: Path | None) -> None:
@@ -333,22 +382,144 @@ def _resolve_revisions(
     return backend.resolve_base(base, target, tip), target
 
 
-class _Fingerprint:
-    """The environment fingerprint, computed on first use: it costs an interpreter start, and a
-    run whose revisions are all the working copy never needs it."""
+class _EnvironmentProbe:
+    """mypy's environment, inspected on first use: it costs an interpreter start, and a run
+    whose revisions are all the working copy never needs it."""
 
     def __init__(self, mypy: ToolInfo, project: Path) -> None:
         self._mypy = mypy
         self._project = project
-        self._computed = False
-        self._value: str | None = None
+        self._done = False
+        self._value: Environment | None = None
 
-    def get(self) -> str | None:
-        """The fingerprint, or None when the environment could not be inspected."""
-        if not self._computed:
-            self._value = environment_fingerprint(self._mypy, self._project)
-            self._computed = True
+    def get(self) -> Environment | None:
+        """The environment, or None when it could not be inspected."""
+        if not self._done:
+            self._value = inspect_environment(self._mypy, self._project)
+            self._done = True
         return self._value
+
+
+@dataclasses.dataclass(frozen=True)
+class _Checked:
+    """The diagnostics of one revision, and the targets missing from its checkout."""
+
+    messages: tuple[MypyMessage, ...]
+    dropped_targets: tuple[str, ...] = ()
+
+
+def _describe(revision: RevisionInfo) -> str:
+    return "the working copy" if revision.is_working_copy else f"revision {revision.short_id}"
+
+
+def _repo_paths(messages: Iterable[MypyMessage], project: Project) -> list[MypyMessage]:
+    """mypy prints paths relative to the project directory; report them repository-relative,
+    which is what `git show`, CI annotations and the root-level view expect."""
+    return [
+        dataclasses.replace(message, path=project.repo_path(message.path)) for message in messages
+    ]
+
+
+def _check_targets_exist(
+    base_run: _Checked, target_run: _Checked, base: RevisionInfo, target: RevisionInfo
+) -> None:
+    """A target missing from one checkout is the user's new (or deleted) file; missing from both,
+    it is a typo, and leaving it out on both sides would report "No change" for nothing."""
+    nowhere = [path for path in target_run.dropped_targets if path in base_run.dropped_targets]
+    if nowhere:
+        raise MypyDiffError(
+            f"`{nowhere[0]}` exists neither in {_describe(base)} nor in {_describe(target)}.",
+            "Paths after `--` are relative to the project directory, as they are for mypy.",
+        )
+
+
+#: Codes mypy uses when an import cannot be resolved.
+_IMPORT_CODES = frozenset({"import-not-found", "import-untyped", "import"})
+_QUOTED = re.compile(r'"([^"]+)"')
+
+
+def _asymmetry_warning(backend: VcsBackend, result: DiffResult, project: Project) -> str | None:
+    """Say so when the base probably could not see files the working copy has.
+
+    The base is checked in a clean checkout. Files git ignores (generated code: `*_pb2.py`,
+    `_version.py`) and submodules are not there, so imports of them fail in the base only: an
+    import error shows up as FIXED, and every pre-existing error in code using those modules, now
+    that their types are known, shows up as NEW. A FIXED import error whose import line is still
+    in the working copy, together with ignored Python files or submodules, is the tell.
+    """
+    still_imported = [
+        message
+        for message in result.fixed
+        if message.code in _IMPORT_CODES and _line_still_present(backend, result, message, project)
+    ]
+    if not still_imported:
+        return None
+    ignored = backend.ignored_python_files()
+    submodules = (project.root / ".gitmodules").is_file()
+    if not ignored and not submodules:
+        return None
+
+    example = still_imported[0]
+    module = _QUOTED.search(example.message)
+    named = f" (`{module.group(1)}` in {example.path}:{example.line})" if module else ""
+    missing = []
+    if ignored:
+        missing.append("files git ignores, such as " + ", ".join(ignored))
+    if submodules:
+        missing.append("submodules")
+    count = len(still_imported)
+    return (
+        f"{count} import {'error exists' if count == 1 else 'errors exist'} only in the base"
+        f"{named}, on import lines your change kept. The base is checked in a clean checkout, "
+        f"without {' and '.join(missing)}. Errors in code that uses those modules may be "
+        "reported as NEW."
+    )
+
+
+def _line_still_present(
+    backend: VcsBackend, result: DiffResult, message: MypyMessage, project: Project
+) -> bool:
+    base_text = backend.file_at(result.base, message.path)
+    if base_text is None:
+        return False
+    lines = base_text.splitlines()
+    if not 1 <= message.line <= len(lines):
+        return False
+    wanted = lines[message.line - 1].strip()
+    try:
+        current = (project.root / message.path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    return bool(wanted) and any(line.strip() == wanted for line in current.splitlines())
+
+
+def _check_checkout_was_used(
+    messages: Iterable[MypyMessage],
+    workdir: Path,
+    checkout: Path,
+    project: Project,
+    revision: RevisionInfo,
+) -> None:
+    """Refuse a result for a revision that was partly checked from the working copy.
+
+    mypy reached files of the working copy from inside the checkout: an import path still
+    points there. The result would describe neither revision, and caching it would keep it.
+    """
+    root = project.root.resolve()
+    inside = checkout.resolve()
+    for message in messages:
+        if not message.path:
+            continue
+        location = (workdir / message.path).resolve()
+        if location.is_relative_to(root) and not location.is_relative_to(inside):
+            raise MypyDiffError(
+                f"Checking {_describe(revision)} read files from your working copy, e.g. "
+                f"{location.relative_to(root).as_posix()}.",
+                "mypy found them through an import path that points into the working copy",
+                "(an editable install, PYTHONPATH or MYPYPATH), not into the checkout of that",
+                "revision, so its result would be wrong. Name the files to check instead, e.g.",
+                '    [tool.mypy]  files = ["src"]   (or: mypy_path = "src")',
+            )
 
 
 def _messages_for(
@@ -357,18 +528,19 @@ def _messages_for(
     mypy: ToolInfo,
     mypy_args: tuple[str, ...],
     cache: ResultCache,
-    environment: _Fingerprint,
+    environment: _EnvironmentProbe,
     project: Project,
     console: Console,
     verbose: bool,
     activity: Activity,
-) -> tuple[MypyMessage, ...]:
+) -> _Checked:
     """Run mypy for one revision, using the cache when the revision is immutable."""
     what = "working copy" if revision.is_working_copy else revision.short_id
     activity.step(f"Checking {what}")
 
     cache_key: str | None = None
-    fingerprint = environment.get() if not revision.is_working_copy and cache.enabled else None
+    inspected = environment.get() if not revision.is_working_copy else None
+    fingerprint = inspected.fingerprint if inspected is not None and cache.enabled else None
     if not revision.is_working_copy and cache.enabled and fingerprint is None and verbose:
         # Without knowing what is installed, a cached base could be from another environment.
         console.print("[dim]result cache off: could not inspect mypy's environment[/dim]")
@@ -380,13 +552,15 @@ def _messages_for(
             project.subdir,
             fingerprint,
         )
-        cached = cache.load(cache_key)
+        cached = cache.load_entry(cache_key)
         if cached is not None:
             if verbose:
                 console.print(f"[dim]cache hit for {revision.short_id}[/dim]")
             activity.detail(f"Checking {what} (cached)")
-            return cached
+            return _Checked(*cached)
 
+    run_env: dict[str, str] = {}
+    checkout: Path | None = None
     with ExitStack() as stack:
         if revision.is_working_copy:
             # Run in place: it is faster and it is what the developer actually sees on disk.
@@ -402,6 +576,13 @@ def _messages_for(
                     f"The project directory `{project.subdir}` does not exist in {what}.",
                     "Pick a base revision that already has it, e.g. `-b <rev>`.",
                 )
+            if inspected is not None:
+                import_dirs = repository_import_dirs(inspected, project.root)
+                run_env = checkout_environment(import_dirs, project.root, checkout)
+                if verbose and import_dirs:
+                    console.print(
+                        f"[dim]importing {', '.join(import_dirs)} from the checkout[/dim]"
+                    )
 
         activity.detail(f"Running mypy on {what}")
 
@@ -413,24 +594,22 @@ def _messages_for(
             mypy_args,
             cache.mypy_cache_dir(revision, stack, project.subdir),
             prog=f"mypy-diff-{backend.name}",
-            what="the working copy"
-            if revision.is_working_copy
-            else f"revision {revision.short_id}",
+            what=_describe(revision),
+            env=run_env,
         )
+        if checkout is not None:
+            _check_checkout_was_used(run.messages, workdir, checkout, project, revision)
 
     if verbose and run.skipped_lines:
         console.print(f"[dim]skipped {run.skipped_lines} non-JSON line(s) from mypy[/dim]")
+    if verbose:
+        for path in run.dropped_targets:
+            console.print(f"[dim]{path} does not exist in {what}: checked without it[/dim]")
 
-    # mypy printed paths relative to the project directory. Report them relative to the
-    # repository instead: that is what `git show`, CI annotations and the root-level view expect.
-    messages = tuple(
-        dataclasses.replace(message, path=project.repo_path(message.path))
-        for message in run.messages
-    )
-
+    messages = tuple(_repo_paths(run.messages, project))
     if cache_key is not None:
-        cache.store(cache_key, messages)
-    return messages
+        cache.store(cache_key, messages, run.dropped_targets)
+    return _Checked(messages, run.dropped_targets)
 
 
 def _diff(

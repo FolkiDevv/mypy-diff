@@ -106,7 +106,7 @@ def test_notes_are_printed_under_their_error() -> None:
 
 def test_json_is_machine_readable() -> None:
     payload = json.loads(capture(RESULT, OutputFormat.JSON))
-    assert payload["summary"] == {"new": 1, "fixed": 1, "unchanged": 2, "net": 0}
+    assert payload["summary"] == {"new": 1, "fixed": 1, "changed": 0, "unchanged": 2, "net": 0}
     assert payload["base"]["commit_id"] == "a" * 40
     assert payload["base"]["change_id"] == "zqxlrpvw"
     assert payload["target"]["working_copy"] is True
@@ -153,3 +153,42 @@ def test_plain_has_no_ansi_escapes() -> None:
     output = capture(RESULT, OutputFormat.PLAIN)
     assert "\x1b[" not in output
     assert "+ NEW (1)" in output
+
+
+CHANGED = DiffResult(
+    base=BASE,
+    target=TARGET,
+    changed=(
+        (
+            message(3, "arg-type", 'Argument 1 has type "str"; expected "int"'),
+            message(4, "arg-type", 'Argument 1 has type "str"; expected "float"'),
+        ),
+    ),
+)
+
+
+def test_pretty_shows_changed_errors_with_their_old_text() -> None:
+    output = capture(CHANGED, OutputFormat.PRETTY)
+    assert "~ CHANGED (1)" in output
+    assert '~ src/app.py:4:4: error: Argument 1 has type "str"; expected "float"' in output
+    assert '~   was: line 3: Argument 1 has type "str"; expected "int"' in output
+    assert "1 changed" in output
+    assert "No change" not in output
+
+
+def test_json_lists_changed_pairs() -> None:
+    payload = json.loads(capture(CHANGED, OutputFormat.JSON))
+    assert payload["summary"]["changed"] == 1
+    assert payload["changed"][0]["old"]["line"] == 3
+    assert payload["changed"][0]["new"]["line"] == 4
+
+
+def test_github_reports_changed_errors_as_notices() -> None:
+    output = capture(CHANGED, OutputFormat.GITHUB)
+    assert output.startswith("::notice file=src/app.py,line=4,")
+    assert "(changed)" in output
+    assert "%0Awas: " in output
+
+
+def test_only_new_hides_changed_errors() -> None:
+    assert "CHANGED" not in capture(CHANGED, OutputFormat.PRETTY, only=Only.NEW)

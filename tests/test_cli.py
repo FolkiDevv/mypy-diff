@@ -258,6 +258,43 @@ def test_base_is_derived_from_the_target_not_from_head(
         assert "1 unchanged error" in result.output
 
 
+@pytest.mark.skipif(GIT is None, reason="git is not installed")
+def test_merging_main_into_a_pushed_branch_reports_nothing_of_mains(
+    git_repo: Repo, short_tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The base used to be the merge's first parent: main's fixes and errors came out as yours."""
+    assert GIT is not None
+    monkeypatch.chdir(git_repo.root)
+    root = git_repo.root
+    run([GIT, "checkout", "-q", "-b", "feature"], cwd=root)
+    git_repo.write("src/clean.py", BROKEN_SOURCE)
+    run([GIT, "commit", "-qam", "feature adds an error"], cwd=root)
+    run([GIT, "push", "-q", "-u", "origin", "feature"], cwd=root)
+
+    other = short_tmp_path / "colleague"
+    remote = str(root.parent / "remote.git")
+    run([GIT, "clone", "-q", "--branch", "main", remote, str(other)], cwd=short_tmp_path)
+    run([GIT, "config", "user.email", "c@example.com"], cwd=other)
+    run([GIT, "config", "user.name", "Colleague"], cwd=other)
+    (other / "src" / "legacy.py").write_text(
+        "def broken() -> str:\n    return 'ok'\n", encoding="utf-8"
+    )
+    (other / "src" / "colleague.py").write_text(
+        "def c() -> int:\n    return 'c'\n", encoding="utf-8"
+    )
+    run([GIT, "add", "-A"], cwd=other)
+    run([GIT, "commit", "-qm", "colleague fixes legacy, adds an error"], cwd=other)
+    run([GIT, "push", "-q", "origin", "main"], cwd=other)
+
+    run([GIT, "fetch", "-q"], cwd=root)
+    run([GIT, "merge", "-q", "--no-ff", "-m", "merge main", "origin/main"], cwd=root)
+
+    result = invoke(git_repo, "--", "src")
+
+    assert result.exit_code == EXIT_OK, result.output
+    assert "No change in mypy errors." in result.output
+
+
 def test_unknown_base_fails_cleanly(repo: Repo) -> None:
     result = invoke(repo, "-b", "no-such-branch", "--", "src")
     assert result.exit_code == EXIT_FAILURE
@@ -636,11 +673,137 @@ def test_an_uninspectable_environment_turns_the_result_cache_off(
     repo: Repo, short_tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A key that cannot tell environments apart would hand back a stale base."""
-    monkeypatch.setattr("mypy_diff.cli.environment_fingerprint", lambda *args: None)
+    monkeypatch.setattr("mypy_diff.cli.inspect_environment", lambda *args: None)
     cache = short_tmp_path / "cache"
     invoke(repo, "--", "src", cache=cache)
     assert list(cache.glob("*.json")) == []
     assert "cache hit" not in invoke(repo, "-v", "--", "src", cache=cache).output
+
+
+# ------------------------------------------------------------------ targets and blocking errors
+
+
+def test_a_new_file_named_after_the_separator_is_new_not_an_error(repo: Repo) -> None:
+    """The file the user asks about does not exist in the base yet: it has no errors there."""
+    repo.write("src/fresh.py", "def f() -> int:\n    return 'x'\n")
+    result = invoke(repo, "--", "src/legacy.py", "src/fresh.py")
+    assert result.exit_code == EXIT_NEW_ERRORS, result.output
+    assert "+ NEW (1)" in result.output
+    assert "src/fresh.py:2" in result.output
+    assert "1 unchanged error" in result.output
+
+
+def test_only_a_new_file_named_compares_against_nothing(repo: Repo) -> None:
+    repo.write("src/fresh.py", "def f() -> int:\n    return 'x'\n")
+    result = invoke(repo, "--", "src/fresh.py")
+    assert result.exit_code == EXIT_NEW_ERRORS, result.output
+    assert "Found 1 new, 0 fixed, 0 unchanged" in result.output
+
+
+def test_a_path_missing_from_both_revisions_is_an_error(repo: Repo) -> None:
+    """Leaving a typo out on both sides would report "No change" for nothing."""
+    result = invoke(repo, "--", "src/legacy.py", "src/typo.py")
+    assert result.exit_code == EXIT_FAILURE
+    assert "`src/typo.py` exists neither in" in result.output
+
+
+def test_a_syntax_error_in_the_working_copy_is_reported_as_new(repo: Repo) -> None:
+    """mypy reports nothing else past a blocking error, but the error itself is the news."""
+    repo.write("src/clean.py", "def broken(:\n")
+    result = invoke(repo, "--", "src")
+    assert result.exit_code == EXIT_NEW_ERRORS, result.output
+    assert "+ NEW (1)" in result.output
+    assert "src/clean.py:1" in result.output
+    assert "[syntax]" in result.output
+    assert "blocking error in the working copy" in result.output
+    assert "FIXED" not in result.output
+
+
+def test_a_syntax_error_in_the_base_is_explained(repo: Repo) -> None:
+    repo.write("src/clean.py", "def broken(:\n")
+    commit_as_main(repo, "broken base")
+    repo.write("src/clean.py", "def fixed() -> None: ...\n")
+    result = invoke(repo, "-b", "main", "--", "src")
+    assert result.exit_code == EXIT_FAILURE
+    assert "blocking error" in result.output
+    assert "src/clean.py:1" in result.output
+    assert "--exclude" in result.output
+
+
+# ------------------------------------------------------------------ imports from the working copy
+
+SHARED_STR = "def value() -> str:\n    return 's'\n"
+USES_SHARED = "from shared import value\n\n\ndef count() -> int:\n    return value()\n"
+
+
+def test_the_base_imports_from_its_own_checkout(
+    repo: Repo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An absolute PYTHONPATH (or an editable install) points into the working copy.
+
+    The base used to import `shared` from there, saw the working copy's new return type, and
+    the error the change caused was reported as "unchanged".
+    """
+    # A typed package (PEP 561), like an editable workspace member.
+    repo.write("lib/shared/__init__.py", SHARED_STR)
+    repo.write("lib/shared/py.typed", "")
+    repo.write("src/uses.py", USES_SHARED)
+    commit_as_main(repo, "uses shared")
+    repo.write("lib/shared/__init__.py", "def value() -> bytes:\n    return b's'\n")
+    monkeypatch.setenv("PYTHONPATH", str(repo.root / "lib"))
+
+    result = invoke(repo, "-b", "main", "--", "src")
+
+    assert "~ CHANGED (1)" in result.output, result.output
+    assert 'got "bytes"' in result.output
+    assert 'was: Incompatible return value type (got "str"' in result.output
+
+
+def test_a_base_check_that_reads_the_working_copy_is_refused(repo: Repo) -> None:
+    """An absolute mypy_path in the config cannot be moved; the result must not be trusted."""
+    repo.write("lib/shared.py", "def value() -> int:\n    return 's'\n")
+    repo.write("src/uses.py", USES_SHARED)
+    config = repo.read("pyproject.toml")
+    repo.write("pyproject.toml", config + f'mypy_path = "{(repo.root / "lib").as_posix()}"\n')
+    commit_as_main(repo, "absolute mypy_path")
+
+    result = invoke(repo, "-b", "main", "--", "src")
+
+    assert result.exit_code == EXIT_FAILURE, result.output
+    assert "read files from your working copy" in result.output
+
+
+@pytest.mark.skipif(GIT is None, reason="git is not installed")
+def test_a_generated_module_the_base_lacks_is_pointed_out(
+    git_repo: Repo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ignored, generated code is missing from the clean checkout of the base."""
+    monkeypatch.chdir(git_repo.root)
+    git_repo.write(".gitignore", "gen_pb2.py\n")
+    git_repo.write("src/app.py", 'import gen_pb2\n\nlabel = "v" + gen_pb2.VERSION\n')
+    commit_as_main(git_repo, "uses generated code")
+    git_repo.write("src/gen_pb2.py", "VERSION: int = 1\n")
+
+    result = invoke(git_repo, "-b", "main", "--", "src")
+
+    assert "import error exists only in the base" in result.output
+    assert "src/gen_pb2.py" in result.output
+
+
+# ------------------------------------------------------------------ changed errors
+
+
+def test_a_reworded_error_is_changed_and_does_not_fail(repo: Repo) -> None:
+    """legacy.py's error names the declared return type; widening it rewords the old error."""
+    repo.write("src/legacy.py", 'def broken() -> float:\n    return "already wrong"\n')
+    result = invoke(repo, "--", "src")
+    assert result.exit_code == EXIT_OK, result.output
+    assert "~ CHANGED (1)" in result.output
+    assert 'expected "float"' in result.output
+    assert 'was: Incompatible return value type (got "str", expected "int")' in result.output
+
+    strict = invoke(repo, "--fail-on-changed", "--", "src")
+    assert strict.exit_code == EXIT_NEW_ERRORS
 
 
 def test_version_flag(repo: Repo) -> None:

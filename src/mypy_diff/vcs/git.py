@@ -13,6 +13,8 @@ from .base import Runner, checkout_name, temporary_parent
 
 _LOG_FORMAT = "%H%x09%h%x09%D%x09%s"
 _FALLBACK_TRUNKS = ("main", "master", "develop", "trunk")
+#: More pushed bases than this are not reduced pairwise (one git call per pair).
+_MAX_BASES = 8
 #: Decorations `%D` prints that are not refs. A shallow clone marks its boundary "grafted".
 _NOT_REFS = frozenset({"grafted"})
 
@@ -105,10 +107,15 @@ class GitBackend:
         )
 
     def default_base(self, target: RevisionInfo | None = None) -> RevisionInfo:
-        """The latest ancestor of ``target`` that has been pushed to any remote.
+        """The latest pushed state ``target`` is built on.
 
         ``target`` defaults to the working copy. For any other target (``--to X``) everything is
         computed from X, not from HEAD: HEAD may be on another branch altogether.
+
+        Usually that is one commit: the parent of the oldest unpushed commit. Merges make it
+        several — `git merge origin/main` into a pushed branch builds on both the pushed branch
+        and main — and picking one of them would report everything the other brought in as the
+        user's own work. Then the base is their merge, made on the fly: exactly what is pushed.
         """
         self.root()
         target = target or self.working_copy()
@@ -118,24 +125,33 @@ class GitBackend:
                 "Base is derived from remote-tracking refs; run `git fetch` if they are stale."
             )
 
-        # Commits reachable from the target but from no remote ref == everything not yet pushed.
-        unpushed = self._git.lines(
-            "rev-list", "--topo-order", "--reverse", tip, "--not", "--remotes"
-        )
         if self._has_remote_refs():
-            if unpushed:
-                parent = self._describe(f"{unpushed[0]}^")
-                if parent is not None:
-                    return parent
-                # The oldest unpushed commit is a root commit — fall through to the trunk guesses.
-            elif target.is_working_copy:
-                # Everything is pushed: HEAD itself is the latest pushed revision, and the
-                # uncommitted changes on disk are the work to check.
-                head = self._describe(tip)
-                if head is not None:
-                    return head
-            # A pushed revision other than the working copy would be compared with itself.
-            # Use where it forked from the trunk instead.
+            heads = [tip]
+            if target.is_working_copy:
+                # In the middle of a merge, the working copy already holds the other side.
+                merge_head = self._git.try_out("rev-parse", "-q", "--verify", "MERGE_HEAD")
+                if merge_head:
+                    heads.append(merge_head)
+            pushed = self._pushed_bases(heads)
+            if pushed == [tip] and not target.is_working_copy:
+                # A pushed revision other than the working copy would be compared with itself.
+                # Use where it forked from the trunk instead.
+                pushed = []
+            if len(pushed) == 1:
+                base = self._describe(pushed[0])
+                if base is not None:
+                    return base
+            elif len(pushed) > 1:
+                merged = self._virtual_merge(pushed)
+                if merged is not None:
+                    return merged
+                self.warnings.append(
+                    "Your unpushed work builds on several pushed commits ("
+                    + ", ".join(commit[:7] for commit in pushed)
+                    + ") that cannot be merged cleanly; comparing against the fork point with "
+                    "the trunk instead."
+                )
+            # Nothing pushed underneath (a root commit): fall through to the trunk guesses.
 
         for revspec in self._trunk_candidates():
             merge_base = self._git.try_out("merge-base", revspec, tip)
@@ -152,6 +168,61 @@ class GitBackend:
             f"{target.short_id} has no pushed ancestor, no trunk branch and no parent commit.",
             "Pass one explicitly, e.g. `-b main`.",
         )
+
+    def _pushed_bases(self, heads: list[str]) -> list[str]:
+        """The newest pushed commits the heads are built on, none an ancestor of another.
+
+        `rev-list --boundary` lists what is not pushed, then (prefixed with "-") the pushed
+        commits that work sits on. A head that is pushed itself is its own base.
+        """
+        lines = self._git.lines("rev-list", "--boundary", *heads, "--not", "--remotes")
+        unpushed = {line for line in lines if not line.startswith("-")}
+        candidates = [line[1:] for line in lines if line.startswith("-")]
+        candidates += [head for head in heads if head not in unpushed]
+        unique = list(dict.fromkeys(candidates))
+        if len(unique) > _MAX_BASES:
+            return unique  # too tangled to reduce; the caller falls back to the trunk
+        return [
+            commit
+            for commit in unique
+            if not any(other != commit and self._is_ancestor(commit, other) for other in unique)
+        ]
+
+    def _virtual_merge(self, commits: list[str]) -> RevisionInfo | None:
+        """A commit merging ``commits``, or None when they conflict (or git is too old).
+
+        The commit is made with fixed author, committer and dates so that the same merge always
+        gets the same id: the result cache and mypy's incremental cache key on it. It is not on
+        any branch; git's garbage collection removes it eventually.
+        """
+        if len(commits) != 2:
+            return None
+        tree = self._git.try_out("merge-tree", "--write-tree", *commits)
+        if not tree:
+            return None  # a conflict, or git < 2.38 without --write-tree
+        tree = tree.splitlines()[0].strip()
+        identity = {
+            "GIT_AUTHOR_NAME": "mypy-diff",
+            "GIT_AUTHOR_EMAIL": "mypy-diff@localhost",
+            "GIT_AUTHOR_DATE": "@0 +0000",
+            "GIT_COMMITTER_NAME": "mypy-diff",
+            "GIT_COMMITTER_EMAIL": "mypy-diff@localhost",
+            "GIT_COMMITTER_DATE": "@0 +0000",
+        }
+        message = "mypy-diff: merge of " + " and ".join(commit[:7] for commit in commits)
+        completed = self._git.run(
+            "commit-tree",
+            "--no-gpg-sign",  # a signature would prompt, and its timestamp would change the id
+            tree,
+            *(arg for c in commits for arg in ("-p", c)),
+            "-m",
+            message,
+            check=False,
+            env=identity,
+        )
+        if completed.returncode != 0:
+            return None
+        return self._describe(completed.stdout.strip())
 
     def _has_remote_refs(self) -> bool:
         return bool(self._git.try_out("for-each-ref", "--format=%(refname)", "refs/remotes/"))
@@ -222,6 +293,15 @@ class GitBackend:
         """The common ancestor of ``rev`` and ``target`` (default: the working copy)."""
         target = target or self.working_copy()
         merge_base = self._git.try_out("merge-base", rev.commit_id, target.commit_id)
+        if merge_base and target.is_working_copy:
+            # Mid-merge, the working copy already contains MERGE_HEAD: `git merge main` brought
+            # main's changes in, and they must not count as the user's.
+            merge_head = self._git.try_out("rev-parse", "-q", "--verify", "MERGE_HEAD")
+            other = (
+                self._git.try_out("merge-base", rev.commit_id, merge_head) if merge_head else None
+            )
+            if other and other != merge_base and self._is_ancestor(merge_base, other):
+                merge_base = other
         if merge_base:
             info = self._describe(merge_base)
             return info if info is not None else rev
@@ -288,6 +368,10 @@ class GitBackend:
     def cleanup_stale(self) -> None:
         self._git.run("worktree", "prune", check=False)
 
+    def ignored_python_files(self, limit: int = 5) -> list[str]:
+        """Python files in the working copy that git ignores: a clean checkout lacks them."""
+        return _ignored_python_files(self._git, limit)
+
 
 def _spellings_of(revspec: str) -> list[str]:
     """Refs a bare branch name may stand for. Anything else (a SHA, a revision expression, a
@@ -300,3 +384,34 @@ def _spellings_of(revspec: str) -> list[str]:
         f"origin/{revspec}",
         f"upstream/{revspec}",
     ]
+
+
+#: Ignored directories that are environments or build output, not code a checkout would need.
+_NOT_SOURCE = frozenset(
+    {"site-packages", "node_modules", "__pycache__", "venv", "env", "build", "dist"}
+)
+
+
+def _ignored_python_files(git: Runner, limit: int) -> list[str]:
+    completed = git.run(
+        "ls-files",
+        "--others",
+        "--ignored",
+        "--exclude-standard",
+        "-z",
+        "--",
+        "*.py",
+        "*.pyi",
+        check=False,
+    )
+    if completed.returncode != 0:
+        return []
+    found: list[str] = []
+    for path in completed.stdout.split("\0"):
+        parts = path.split("/")
+        if not path or any(part.startswith(".") or part in _NOT_SOURCE for part in parts[:-1]):
+            continue
+        found.append(path)
+        if len(found) >= limit:
+            break
+    return found

@@ -7,9 +7,11 @@ stubs and would report a flood of spurious import/attribute errors.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -43,6 +45,38 @@ class MypyRun:
     stdout: str
     stderr: str
     skipped_lines: int
+    #: Targets after `--` that do not exist in this checkout and were left out.
+    dropped_targets: tuple[str, ...] = ()
+
+
+class BlockingErrors(MypyDiffError):
+    """mypy stopped at an error it cannot analyse past: a syntax error, a duplicate module.
+
+    It reports nothing else for that revision, so there is no full report to diff — but the
+    blocking diagnostics themselves are known, and on the target side they are exactly the news.
+    """
+
+    def __init__(self, what: str, messages: tuple[MypyMessage, ...], details: list[str]) -> None:
+        super().__init__(
+            f"mypy stopped at a blocking error in {what}.",
+            *(message.format() for message in messages),
+            *details,
+        )
+        self.what = what
+        self.messages = messages
+
+
+class MissingTarget(MypyDiffError):
+    """A path mypy was asked to check does not exist in this checkout."""
+
+    def __init__(self, path: str, what: str) -> None:
+        super().__init__(
+            f"`{path}` does not exist in {what}.",
+            "It is named in your mypy config (`files`). If it is generated or not committed,",
+            "a clean checkout of a revision cannot have it: generate it in both, or pass the",
+            "paths to check after `--` instead.",
+        )
+        self.path = path
 
 
 def resolve_mypy(
@@ -170,6 +204,7 @@ def run_mypy(
     cache_dir: Path,
     prog: str = "mypy-diff",
     what: str = "the working copy",
+    env: dict[str, str] | None = None,
 ) -> MypyRun:
     """Run mypy inside ``workdir`` and parse its diagnostics.
 
@@ -182,7 +217,95 @@ def run_mypy(
     Anything that is not a trustworthy, complete report raises instead of returning: an empty
     result would be diffed — and possibly cached — as "this revision has no errors", which turns
     every error of the other side into NEW or FIXED.
+
+    One exception is made: a target after `--` that does not exist in this checkout — the new
+    file the user is asking about does not exist in the base yet, a deleted one no longer exists
+    in the working copy. It has no errors there by definition, so it is left out and mypy runs
+    again. When no target is left, the report is empty; running mypy without targets would make
+    it check what the config names instead.
     """
+    remaining = list(mypy_args)
+    dropped: list[str] = []
+    while True:
+        try:
+            run = _run_once(mypy, workdir, tuple(remaining), cache_dir, prog, what, env or {})
+        except MissingTarget as missing:
+            position = _position_of(missing.path, remaining)
+            if position is None:
+                raise
+            dropped.append(remaining.pop(position))
+            if not _names_targets(remaining):
+                return MypyRun((), 0, "", "", 0, tuple(dropped))
+            continue
+        return dataclasses.replace(run, dropped_targets=tuple(dropped))
+
+
+def _position_of(path: str, arguments: list[str]) -> int | None:
+    wanted = os.path.normpath(path)
+    for index, argument in enumerate(arguments):
+        if not argument.startswith("-") and os.path.normpath(argument) == wanted:
+            return index
+    return None
+
+
+#: mypy options that take a value as the next argument, so that value is not a target.
+_VALUE_OPTIONS = frozenset(
+    {
+        "--python-version",
+        "--platform",
+        "--config-file",
+        "--cache-dir",
+        "--exclude",
+        "--always-true",
+        "--always-false",
+        "--enable-error-code",
+        "--disable-error-code",
+        "--custom-typeshed-dir",
+        "--python-executable",
+        "--package-root",
+        "--junit-xml",
+        "--junit-format",
+        "--html-report",
+        "--txt-report",
+        "--xml-report",
+        "--linecount-report",
+        "--linecoverage-report",
+        "--lineprecision-report",
+        "--any-exprs-report",
+        "--cobertura-xml-report",
+        "--memory-xml-report",
+        "--xslt-html-report",
+        "--xslt-txt-report",
+        "--soft-error-limit",
+        "--perf-stats-file",
+        "--enable-incomplete-feature",
+    }
+)
+#: Options whose value *is* a target: a module, a package, a program.
+_TARGET_OPTIONS = frozenset({"-m", "--module", "-p", "--package", "-c", "--command"})
+
+
+def _names_targets(arguments: list[str]) -> bool:
+    """Whether mypy arguments still name something to check, after missing paths were dropped."""
+    previous = ""
+    for argument in arguments:
+        if argument in _TARGET_OPTIONS:
+            return True
+        if not argument.startswith("-") and previous not in _VALUE_OPTIONS:
+            return True
+        previous = argument
+    return False
+
+
+def _run_once(
+    mypy: ToolInfo,
+    workdir: Path,
+    mypy_args: tuple[str, ...],
+    cache_dir: Path,
+    prog: str,
+    what: str,
+    env: dict[str, str],
+) -> MypyRun:
     argv = [
         *mypy.command,
         *_FORCED_ARGS,
@@ -202,7 +325,7 @@ def run_mypy(
             text=True,
             encoding="utf-8",
             errors="replace",
-            env={**os.environ, "MYPY_FORCE_COLOR": "0", "NO_COLOR": "1"},
+            env={**os.environ, **env, "MYPY_FORCE_COLOR": "0", "NO_COLOR": "1"},
         )
     except OSError as failure:
         raise MypyDiffError(
@@ -211,7 +334,7 @@ def run_mypy(
         ) from failure
 
     if completed.returncode not in (0, 1):
-        raise _fatal_error(completed, prog, what)
+        raise _fatal_error(completed, prog, what, workdir)
 
     messages, skipped = parse_json_output(completed.stdout, workdir)
     if not messages and completed.stderr.strip():
@@ -261,6 +384,10 @@ def _with_non_interactive(mypy_args: tuple[str, ...]) -> tuple[str, ...]:
     return mypy_args
 
 
+def _output_lines_of(stream: str | None) -> list[str]:
+    return [line.rstrip() for line in (stream or "").splitlines() if line.strip()]
+
+
 def _output_lines(completed: subprocess.CompletedProcess[str]) -> list[str]:
     """Everything mypy printed, stderr first. Both streams: either may hold the explanation."""
     return [
@@ -271,14 +398,20 @@ def _output_lines(completed: subprocess.CompletedProcess[str]) -> list[str]:
     ]
 
 
-#: Ways mypy says "you did not tell me what to analyse". The first is what it actually prints
-#: for a bare invocation ("Missing target module, package, files, or command."); the others
-#: cover configs that name paths which do not exist.
-_NO_TARGET_MARKERS = ("missing target", "cannot read file", "no files")
+#: How mypy says "you did not tell me what to analyse": a bare invocation, no targets configured.
+_NO_TARGET_MARKERS = ("missing target module, package, files, or command",)
+#: How mypy says a path it was asked to check does not exist (or holds no Python files).
+_MISSING_PATH = (
+    re.compile(r"Cannot read file '(?P<path>[^']+)'"),
+    re.compile(r"There are no \.py\[i\] files in directory '(?P<path>[^']+)'"),
+)
 
 
 def _fatal_error(
-    completed: subprocess.CompletedProcess[str], prog: str, what: str = "the working copy"
+    completed: subprocess.CompletedProcess[str],
+    prog: str,
+    what: str = "the working copy",
+    workdir: Path | None = None,
 ) -> MypyDiffError:
     if completed.returncode < 0:
         try:
@@ -292,6 +425,12 @@ def _fatal_error(
         )
 
     details = _output_lines(completed)
+
+    for line in details:
+        for pattern in _MISSING_PATH:
+            missing = pattern.search(line)
+            if missing:
+                return MissingTarget(missing["path"], what)
 
     if any(marker in line.lower() for line in details for marker in _NO_TARGET_MARKERS):
         # mypy answers this one with a full usage dump, which buries the actual problem.
@@ -309,8 +448,12 @@ def _fatal_error(
             '    files = ["src", "tests"]',
         )
 
-    # A blocking error (a syntax error, a duplicate module) arrives as JSON on stdout. Show it
-    # the way mypy would print it, not as a raw JSON object.
+    # A blocking error (a syntax error, a duplicate module) arrives as JSON on stdout.
+    blocking, _ = parse_json_output(completed.stdout, workdir or Path.cwd())
+    if completed.returncode == 2 and blocking:
+        rest = [line for line in _output_lines_of(completed.stderr) if line.strip()]
+        return BlockingErrors(what, blocking, rest)
+
     rendered = [_render_line(line) for line in details]
     return MypyDiffError(f"mypy failed with exit code {completed.returncode} on {what}.", *rendered)
 
@@ -440,6 +583,40 @@ _LAUNCHER_VALUE_OPTIONS = frozenset(
 _USER_CONFIG_FILES = ("~/.config/mypy/config", "~/.mypy.ini")
 
 
+@dataclass(frozen=True, slots=True)
+class Environment:
+    """What mypy's own interpreter reports about the environment it resolves imports in."""
+
+    #: See :func:`environment_fingerprint`.
+    fingerprint: str
+    #: The interpreter's sys.path, as it reported it.
+    sys_path: tuple[str, ...]
+    #: The interpreter's sys.prefix: the virtualenv, whose site-packages are not project code.
+    prefix: str
+
+
+def inspect_environment(mypy: ToolInfo, project: Path) -> Environment | None:
+    """Ask mypy's interpreter about its environment, or None when it cannot be asked."""
+    report = _interpreter_report(mypy.command, project)
+    if not report:
+        return None
+    try:
+        parsed = json.loads(report)
+        sys_path = tuple(str(entry) for entry in parsed.get("path", ()))
+        prefix = str(parsed.get("prefix", ""))
+    except (json.JSONDecodeError, AttributeError, TypeError):
+        return None
+    parts: dict[str, object] = {
+        "command": list(mypy.command),
+        "version": mypy.raw_version,
+        "environment": report,
+        "MYPYPATH": os.environ.get("MYPYPATH", ""),
+        "user_config": _user_config_digest(),
+    }
+    payload = json.dumps(parts, sort_keys=True).encode("utf-8")
+    return Environment(hashlib.sha256(payload).hexdigest(), sys_path, prefix)
+
+
 def environment_fingerprint(mypy: ToolInfo, project: Path) -> str | None:
     """A digest of everything outside the revision that changes what mypy reports.
 
@@ -451,18 +628,85 @@ def environment_fingerprint(mypy: ToolInfo, project: Path) -> str | None:
     None when mypy's interpreter cannot be asked what is installed. A key without that part
     could not tell two environments apart, so the caller must not use the result cache then.
     """
-    report = _interpreter_report(mypy.command, project)
-    if not report:
-        return None
-    parts: dict[str, object] = {
-        "command": list(mypy.command),
-        "version": mypy.raw_version,
-        "environment": report,
-        "MYPYPATH": os.environ.get("MYPYPATH", ""),
-        "user_config": _user_config_digest(),
-    }
-    payload = json.dumps(parts, sort_keys=True).encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()
+    environment = inspect_environment(mypy, project)
+    return None if environment is None else environment.fingerprint
+
+
+def repository_import_dirs(environment: Environment, root: Path) -> tuple[str, ...]:
+    """Import directories mypy's interpreter takes from inside the repository.
+
+    Editable installs (`uv sync` installs a workspace's members, and the project itself, this
+    way) put a `.pth` file into site-packages that points at the *working copy*. So does an
+    absolute PYTHONPATH. When the base revision is checked in its temporary checkout, imports of
+    those packages would still resolve to the working copy: the base is then checked against the
+    current code of its dependencies, and a change there that breaks code here is hidden.
+
+    Returned repository-relative (POSIX), in sys.path order. The interpreter's own environment
+    (a `.venv` inside the repository) is not project code and is left out.
+    """
+    root = root.resolve()
+    prefix = Path(environment.prefix).resolve() if environment.prefix else None
+    found: list[str] = []
+    for entry in environment.sys_path:
+        if not entry:
+            continue  # the current directory, which mypy handles itself
+        path = Path(entry).resolve()
+        if not path.is_relative_to(root):
+            continue
+        if prefix is not None and path.is_relative_to(prefix):
+            continue
+        if {"site-packages", "dist-packages"} & set(path.parts):
+            continue
+        relative = path.relative_to(root).as_posix()
+        if relative not in found:
+            found.append(relative)
+    return tuple(found)
+
+
+def checkout_environment(
+    import_dirs: tuple[str, ...], root: Path, checkout: Path
+) -> dict[str, str]:
+    """Environment variables that make mypy import those directories from ``checkout``.
+
+    PYTHONPATH entries come before site-packages and the paths `.pth` files add, so the checkout's
+    copy wins; mypy also treats them like those paths (installed code, errors silenced), so
+    nothing but *which version* of that code is seen changes. Absolute MYPYPATH entries that point
+    into the working copy are moved into the checkout the same way.
+
+    A directory that holds a package named `mypy` is left alone: on PYTHONPATH it would replace
+    the mypy that is running.
+    """
+    root = root.resolve()
+    moved = [
+        str(checkout / relative)
+        for relative in import_dirs
+        if not (checkout / relative / "mypy").is_dir()
+    ]
+    overrides: dict[str, str] = {}
+    # A relative entry already resolves inside the checkout, where mypy runs.
+    kept = [
+        entry
+        for entry in os.environ.get("PYTHONPATH", "").split(os.pathsep)
+        if entry and not (os.path.isabs(entry) and _inside(entry, root))
+    ]
+    if moved:
+        overrides["PYTHONPATH"] = os.pathsep.join([*moved, *kept])
+
+    mypypath = os.environ.get("MYPYPATH")
+    if mypypath:
+        entries = [
+            str(checkout / Path(entry).resolve().relative_to(root))
+            if os.path.isabs(entry) and _inside(entry, root)
+            else entry
+            for entry in mypypath.split(os.pathsep)
+            if entry
+        ]
+        overrides["MYPYPATH"] = os.pathsep.join(entries)
+    return overrides
+
+
+def _inside(entry: str, root: Path) -> bool:
+    return Path(entry).resolve().is_relative_to(root)
 
 
 def _interpreter_command(command: tuple[str, ...]) -> tuple[str, ...] | None:

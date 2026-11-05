@@ -6,6 +6,7 @@ That keeps the output greppable and keeps `file:line:col` clickable in terminals
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from enum import StrEnum
 from typing import Any
@@ -66,6 +67,12 @@ def _render_human(result: DiffResult, console: Console, only: Only, show_unchang
         _render_section(console, "+ NEW", result.new, "+", "red")
     if only in (Only.ALL, Only.FIXED):
         _render_section(console, "- FIXED", result.fixed, "-", "green")
+    if only is Only.ALL:
+        _render_changed(console, result.changed)
+
+    if result.incomplete:
+        console.print(Text(f"! {result.incomplete}", style="bold yellow"))
+        console.print()
 
     if show_unchanged and result.unchanged:
         _render_section(console, "  UNCHANGED", result.unchanged, " ", "dim")
@@ -97,8 +104,20 @@ def _render_section(
     console.print()
 
 
+def _render_changed(console: Console, pairs: tuple[tuple[MypyMessage, MypyMessage], ...]) -> None:
+    """Pre-existing errors whose text changed in place: the new wording, then the old one."""
+    if not pairs:
+        return
+    console.print(Text(f"~ CHANGED ({len(pairs)})", style="bold yellow"))
+    for old, new in pairs:
+        console.print(Text(f"~ {new.format()}", style="yellow"))
+        was = f"line {old.line}: " if old.line != new.line else ""
+        console.print(Text(f"~   was: {was}{old.message}", style="dim"))
+    console.print()
+
+
 def _summary(result: DiffResult) -> Text:
-    if not result.new and not result.fixed:
+    if not result.new and not result.fixed and not result.changed:
         return Text("No change in mypy errors.", style="bold green")
 
     net = len(result.new) - len(result.fixed)
@@ -107,6 +126,8 @@ def _summary(result: DiffResult) -> Text:
     text.append(f"{len(result.new)} new", style="bold red" if result.new else "bold")
     text.append(", ")
     text.append(f"{len(result.fixed)} fixed", style="bold green" if result.fixed else "bold")
+    if result.changed:
+        text.append(f", {len(result.changed)} changed", style="bold yellow")
     text.append(f", {len(result.unchanged)} unchanged", style="bold")
     text.append(f"  (net {sign}{net})", style="bold red" if net > 0 else "bold green")
     return text
@@ -121,11 +142,13 @@ def _plural(count: int, word: str) -> str:
 
 def _as_json(result: DiffResult, only: Only) -> dict[str, Any]:
     payload: dict[str, Any] = {
+        "incomplete": result.incomplete or None,
         "base": _revision_json(result.base),
         "target": _revision_json(result.target),
         "summary": {
             "new": len(result.new),
             "fixed": len(result.fixed),
+            "changed": len(result.changed),
             "unchanged": len(result.unchanged),
             "net": len(result.new) - len(result.fixed),
         },
@@ -134,6 +157,10 @@ def _as_json(result: DiffResult, only: Only) -> dict[str, Any]:
         payload["new"] = [m.to_json() for m in result.new]
     if only in (Only.ALL, Only.FIXED):
         payload["fixed"] = [m.to_json() for m in result.fixed]
+    if only is Only.ALL:
+        payload["changed"] = [
+            {"old": old.to_json(), "new": new.to_json()} for old, new in result.changed
+        ]
     return payload
 
 
@@ -150,12 +177,18 @@ def _revision_json(revision: Any) -> dict[str, Any]:
 
 def _render_github(result: DiffResult, console: Console, only: Only) -> None:
     """GitHub Actions annotations. Fixed errors become notices so they show up too."""
+    if result.incomplete:
+        console.print(f"::warning title=mypy-diff::{result.incomplete}", markup=False)
     if only in (Only.ALL, Only.NEW):
         for message in result.new:
             console.print(_annotation("error", message, "new"), markup=False, highlight=False)
     if only in (Only.ALL, Only.FIXED):
         for message in result.fixed:
             console.print(_annotation("notice", message, "fixed"), markup=False, highlight=False)
+    if only is Only.ALL:
+        for old, new in result.changed:
+            changed = dataclasses.replace(new, message=f"{new.message}\nwas: {old.message}")
+            console.print(_annotation("notice", changed, "changed"), markup=False, highlight=False)
 
 
 def _annotation(level: str, message: MypyMessage, kind: str) -> str:

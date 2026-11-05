@@ -29,7 +29,7 @@ def message(
 def diff(
     base: list[MypyMessage],
     target: list[MypyMessage],
-    files: dict[str, tuple[str, str]] | None = None,
+    files: dict[str, tuple[str | None, str | None]] | None = None,
 ) -> DiffResult:
     """Run the matcher; `files` maps a path to its (base, target) contents."""
     files = files or {}
@@ -332,3 +332,125 @@ def test_masked_indices_on_one_line_pair_by_column() -> None:
     result = diff(base, target, files={"src/app.py": (base_text, target_text)})
     assert result.new == ()
     assert len(result.unchanged) == 2
+
+
+# ------------------------------------------------------------------ tier 4: changed in place
+
+
+def test_a_reworded_error_on_an_unedited_line_is_changed_not_new() -> None:
+    """A callee in another file was widened: the error stays, its text names the new type."""
+    text = "a\ng('x')\n"
+    result = diff(
+        [message(line=2, code="arg-type", text='Argument 1 to "g" has type "str"; expected "int"')],
+        [
+            message(
+                line=2, code="arg-type", text='Argument 1 to "g" has type "str"; expected "float"'
+            )
+        ],
+        files={"src/app.py": (text, text)},
+    )
+    assert result.new == ()
+    assert result.fixed == ()
+    assert len(result.changed) == 1
+    old, new = result.changed[0]
+    assert "int" in old.message
+    assert "float" in new.message
+    assert not result.has_new
+
+
+def test_changed_needs_the_same_column() -> None:
+    """Another expression on the same line is another error, even with the same code."""
+    text = "a\ng('x', b'y')\n"
+    result = diff(
+        [message(line=2, column=2, code="arg-type", text="first")],
+        [message(line=2, column=7, code="arg-type", text="second")],
+        files={"src/app.py": (text, text)},
+    )
+    assert result.changed == ()
+    assert len(result.new) == 1
+
+
+def test_changed_needs_the_same_code() -> None:
+    text = "a\nb\n"
+    result = diff(
+        [message(line=2, code="arg-type", text="first")],
+        [message(line=2, code="return-value", text="second")],
+        files={"src/app.py": (text, text)},
+    )
+    assert result.changed == ()
+    assert len(result.new) == 1
+
+
+def test_changed_needs_an_unedited_line() -> None:
+    """An edited line has no mapping: a different error there is genuinely new."""
+    result = diff(
+        [message(line=2, code="arg-type", text="first")],
+        [message(line=2, code="arg-type", text="second")],
+        files={"src/app.py": ("a\ng(1)\n", "a\ng('x')\n")},
+    )
+    assert result.changed == ()
+    assert len(result.new) == 1
+
+
+def test_changed_follows_a_shifted_line() -> None:
+    base_text = "a\ng('x')\n"
+    result = diff(
+        [message(line=2, code="arg-type", text="first")],
+        [message(line=3, code="arg-type", text="second")],
+        files={"src/app.py": (base_text, "import os\n" + base_text)},
+    )
+    assert len(result.changed) == 1
+
+
+# ------------------------------------------------------------------ tier 5: across files
+
+LEGACY = "def legacy(s: str) -> int:\n    return s.strip()\n"
+RETURN_ERROR = 'Incompatible return value type (got "str", expected "int")'
+
+
+def test_a_renamed_module_keeps_its_errors_unchanged() -> None:
+    result = diff(
+        [message(path="pkg/utils.py", line=2, code="return-value", text=RETURN_ERROR)],
+        [message(path="pkg/helpers.py", line=2, code="return-value", text=RETURN_ERROR)],
+        files={"pkg/utils.py": (LEGACY, None), "pkg/helpers.py": (None, LEGACY)},
+    )
+    assert result.new == ()
+    assert result.fixed == ()
+    assert len(result.unchanged) == 1
+    assert result.stats["moved_between_files"] == 1
+
+
+def test_code_extracted_into_another_module_keeps_its_errors_unchanged() -> None:
+    """The old module still exists; only the function moved."""
+    core_before = "def keep() -> int:\n    return 1\n\n\n" + LEGACY
+    core_after = "from pkg.legacy import legacy\n\n\ndef keep() -> int:\n    return 1\n"
+    result = diff(
+        [message(path="pkg/core.py", line=6, code="return-value", text=RETURN_ERROR)],
+        [message(path="pkg/legacy.py", line=2, code="return-value", text=RETURN_ERROR)],
+        files={"pkg/core.py": (core_before, core_after), "pkg/legacy.py": (None, LEGACY)},
+    )
+    assert result.new == ()
+    assert len(result.unchanged) == 1
+
+
+def test_a_look_alike_error_on_different_code_in_another_file_is_still_new() -> None:
+    """Same code and text, but another source line: not the same error moved."""
+    result = diff(
+        [message(path="pkg/old.py", line=2, code="return-value", text=RETURN_ERROR)],
+        [message(path="pkg/new.py", line=2, code="return-value", text=RETURN_ERROR)],
+        files={
+            "pkg/old.py": (LEGACY, None),
+            "pkg/new.py": (None, "def other(s: str) -> int:\n    return s.upper()\n"),
+        },
+    )
+    assert len(result.new) == 1
+    assert len(result.fixed) == 1
+
+
+def test_errors_moved_across_files_need_readable_sources() -> None:
+    result = diff(
+        [message(path="pkg/old.py", line=2, code="return-value", text=RETURN_ERROR)],
+        [message(path="pkg/new.py", line=2, code="return-value", text=RETURN_ERROR)],
+    )
+    assert len(result.new) == 1
+    assert len(result.fixed) == 1

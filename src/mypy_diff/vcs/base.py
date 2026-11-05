@@ -51,7 +51,9 @@ class Runner:
         self.verbose = verbose
         self.log: list[str] = []
 
-    def run(self, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+    def run(
+        self, *args: str, check: bool = True, env: dict[str, str] | None = None
+    ) -> subprocess.CompletedProcess[str]:
         argv = [self.executable, *args]
         self.log.append(" ".join(argv))
         completed = subprocess.run(
@@ -66,7 +68,7 @@ class Runner:
             text=True,
             encoding="utf-8",
             errors="replace",
-            env=subprocess_env(),
+            env={**subprocess_env(), **(env or {})},
         )
         if check and completed.returncode != 0:
             raise CommandError(argv, completed.returncode, completed.stderr)
@@ -135,6 +137,10 @@ class VcsBackend(Protocol):
 
     def cleanup_stale(self) -> None:
         """Drop leftovers from runs that crashed before their worktree was removed."""
+        ...
+
+    def ignored_python_files(self, limit: int = 5) -> list[str]:
+        """Up to ``limit`` Python files in the working copy that a clean checkout lacks."""
         ...
 
     def command_log(self) -> Iterator[str]:

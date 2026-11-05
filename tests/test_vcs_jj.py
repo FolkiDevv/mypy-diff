@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 import pytest
@@ -129,8 +130,6 @@ def test_worktree_is_forgotten_even_if_the_body_raises(jj_repo: Repo) -> None:
 def test_cleanup_stale_forgets_workspaces_whose_directory_is_gone(jj_repo: Repo) -> None:
     """Simulates a run that was killed before its `finally` could forget the workspace."""
     assert JJ is not None
-    import shutil
-
     jj = backend(jj_repo)
     orphan = jj_repo.root.parent / "orphan"
     run(
@@ -163,3 +162,47 @@ def test_cleanup_stale_keeps_a_live_workspace(jj_repo: Repo) -> None:
 
     listed = run([JJ, "workspace", "list", "--ignore-working-copy"], cwd=jj_repo.root).stdout
     assert "mypy-diff-live" in listed
+
+
+def test_a_bookmark_on_the_working_copy_is_not_its_own_base(jj_repo: Repo) -> None:
+    """`jj bookmark create feat -r @` names the work itself; the base is below it."""
+    assert JJ is not None
+    jj_repo.write("src/feature.py", "z: int = 3\n")
+    run([JJ, "bookmark", "create", "feat", "-r", "@"], cwd=jj_repo.root)
+    jj = backend(jj_repo)
+    assert jj.default_base().commit_id == jj.resolve("main").commit_id
+
+
+def operations(repo: Repo) -> list[str]:
+    assert JJ is not None
+    log = run(
+        [JJ, "op", "log", "--no-graph", "-T", 'id ++ "\\n"', "--ignore-working-copy"],
+        cwd=repo.root,
+    ).stdout
+    return [line for line in log.splitlines() if line.strip()]
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="git is not installed")
+def test_a_checkout_leaves_the_operation_log_alone(jj_repo: Repo) -> None:
+    """A jj workspace wrote operations, so `jj undo` right after a run undid mypy-diff's own
+    work instead of the user's last change. The checkout now comes from jj's git store."""
+    jj = backend(jj_repo)
+    main = jj.resolve("main")  # snapshots once, up front
+    before = operations(jj_repo)
+
+    with jj.worktree(main) as tree:
+        assert "def add(" in (tree / "src" / "clean.py").read_text(encoding="utf-8")
+
+    assert operations(jj_repo) == before
+
+
+def test_the_working_copy_is_snapshotted_before_anything_is_resolved(jj_repo: Repo) -> None:
+    """Without it, @ is whatever the last jj command saw, not what is on disk."""
+    assert JJ is not None
+    stale = run(
+        [JJ, "log", "-r", "@", "--no-graph", "-T", "commit_id", "--ignore-working-copy"],
+        cwd=jj_repo.root,
+    ).stdout.strip()
+    jj_repo.write("src/feature.py", "z: int = 3\n")
+
+    assert backend(jj_repo).working_copy().commit_id != stale
