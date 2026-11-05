@@ -16,6 +16,7 @@ import re
 import sys
 import traceback
 from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from pathlib import Path
 from typing import Annotated
@@ -26,6 +27,7 @@ from rich.text import Text
 
 from . import MypyDiffError, __version__
 from .cache import ResultCache
+from .cache import location as cache_location
 from .matching import diff_messages
 from .models import DiffResult, MypyMessage, RevisionInfo
 from .mypy_exec import (
@@ -43,8 +45,8 @@ from .mypy_exec import (
 )
 from .preflight import ToolInfo, find_tool, require_vcs
 from .progress import Activity
-from .project import Project, find_project
-from .render import Only, OutputFormat, make_console, render
+from .project import Project, configured_targets, find_project, mypy_config_file
+from .render import Only, OutputFormat, make_console, render, step_summary, summary_text
 from .vcs import GitBackend, JjBackend, VcsBackend
 
 EXIT_OK = 0
@@ -137,6 +139,16 @@ def build_app(backend_type: type[GitBackend] | type[JjBackend]) -> typer.Typer:
         exit_zero: Annotated[
             bool, typer.Option("--exit-zero", help="Always exit 0, even when new errors appear.")
         ] = False,
+        parallel: Annotated[
+            bool | None,
+            typer.Option(
+                "--parallel/--no-parallel",
+                help=(
+                    "Run mypy on base and working copy at the same time. "
+                    "Default: when there are at least 4 CPUs."
+                ),
+            ),
+        ] = None,
         fail_on_changed: Annotated[
             bool,
             typer.Option(
@@ -200,6 +212,7 @@ def build_app(backend_type: type[GitBackend] | type[JjBackend]) -> typer.Typer:
                 doctor=doctor,
                 verbose=verbose,
                 fail_on_changed=fail_on_changed,
+                parallel=parallel,
             )
         except MypyDiffError as failure:
             # Text(), not markup strings: messages quote mypy output and config snippets, and
@@ -251,6 +264,7 @@ def _run(
     doctor: bool,
     verbose: bool,
     fail_on_changed: bool = False,
+    parallel: bool | None = None,
 ) -> int:
     check_mypy_args(mypy_args, prog=f"mypy-diff-{backend_type.name}")
 
@@ -263,20 +277,30 @@ def _run(
         mypy, mypy_source = resolve_mypy(project.directory, mypy_cmd, project.root)
 
         if doctor:
-            _print_doctor(console, backend_type.name, vcs_tool, mypy, mypy_source, project)
+            _print_doctor(
+                console,
+                backend_type.name,
+                vcs_tool,
+                mypy,
+                mypy_source,
+                project,
+                backend,
+                ResultCache(cache_dir, enabled=not no_cache),
+                (base, to, tip),
+            )
             return EXIT_OK
 
         activity.step("Resolving revisions")
-        base_rev, target_rev = _resolve_revisions(backend, base, to, tip)
+        base_rev, target_rev, base_reason = _resolve_revisions(backend, base, to, tip)
         if verbose:
-            _print_verbose_header(
-                console, backend, base_rev, target_rev, mypy, mypy_source, project
-            )
+            _print_verbose_header(errors, backend, base_rev, target_rev, mypy, mypy_source, project)
         for warning in backend.warnings:
             errors.print(Text("warning: ", style="bold yellow") + Text(warning))
 
         cache = ResultCache(cache_dir, enabled=not no_cache)
         environment = _EnvironmentProbe(mypy, project.directory)
+        where = cache_location(project.root, project.subdir)
+        cache.seed(where)
         checked = functools.partial(
             _messages_for,
             backend=backend,
@@ -285,24 +309,56 @@ def _run(
             cache=cache,
             environment=environment,
             project=project,
-            console=console,
+            console=errors,
             verbose=verbose,
-            activity=activity,
+            location=where,
         )
-        try:
-            base_run = checked(revision=base_rev)
-        except BlockingErrors as blocked:
-            raise MypyDiffError(
-                blocked.message,
-                *blocked.details,
-                "",
-                "mypy cannot analyse the base revision past this error, so there is nothing to",
-                "compare against. Pick another base with -b, or leave the file out:",
-                "    -- --exclude <path> <targets>",
-            ) from blocked
 
+        def check_base(progress: Activity) -> _Checked:
+            try:
+                return checked(revision=base_rev, role="base", activity=progress)
+            except BlockingErrors as blocked:
+                raise MypyDiffError(
+                    blocked.message,
+                    *blocked.details,
+                    "",
+                    "mypy cannot analyse the base revision past this error, so there is nothing",
+                    "to compare against. Pick another base with -b, or leave the file out:",
+                    "    -- --exclude <path> <targets>",
+                ) from blocked
+
+        def check_target(progress: Activity) -> _Checked:
+            return checked(revision=target_rev, role="target", activity=progress)
+
+        identical = _same_tree(backend, base_rev, target_rev)
         try:
-            target_run = checked(revision=target_rev)
+            if identical:
+                # Nothing differs between the two: check once, and compare that with itself.
+                errors.print(
+                    Text("warning: ", style="bold yellow")
+                    + Text(
+                        f"the base is the target itself ({base_rev.short_id}), with nothing "
+                        "uncommitted: there is nothing to compare. To compare against a "
+                        "branch, pass it with -b, e.g. -b origin/main."
+                    )
+                )
+                activity.step(f"Checking {_describe(target_rev)}")
+                target_run = check_target(activity)
+                base_run = target_run
+            elif _runs_in_parallel(parallel, target_rev):
+                # The working copy runs in place and the base in its checkout: nothing shared
+                # but the CPU. Running them side by side nearly halves the wall-clock time.
+                activity.step(f"Checking {_describe(base_rev)} and the working copy")
+                quiet = Activity(errors, total=1, enabled=False)
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    base_future = pool.submit(check_base, quiet)
+                    target_future = pool.submit(check_target, quiet)
+                    base_run = base_future.result()
+                    target_run = target_future.result()
+                activity.step(f"Checked {_describe(base_rev)} and the working copy")
+            else:
+                base_run = check_base(activity)
+                target_run = check_target(activity)
         except BlockingErrors as blocked:
             # mypy reports nothing else once it hits a blocking error, so there is no full
             # report to diff. The blocking errors themselves are the news, though: report them
@@ -323,10 +379,16 @@ def _run(
                 backend, base_rev, target_rev, base_run.messages, target_run.messages, project
             )
 
+    result = dataclasses.replace(result, base_reason=base_reason)
     if target_rev.is_working_copy:
         hint = _asymmetry_warning(backend, result, project)
         if hint:
             errors.print(Text("warning: ", style="bold yellow") + Text(hint))
+
+    if output_format is OutputFormat.GITHUB:
+        _write_step_summary(result, errors)
+        # The annotations carry no verdict of their own; the log should.
+        errors.print(summary_text(result))
 
     try:
         render(result, console, output_format, only, show_unchanged)
@@ -342,11 +404,48 @@ def _run(
 
     if verbose:
         for note in backend.notes:
-            console.print(f"[dim]note: {note}[/dim]")
+            _trace(errors, f"note: {note}")
 
     if result.has_new or (fail_on_changed and result.changed):
         return EXIT_NEW_ERRORS
     return EXIT_OK
+
+
+def _same_tree(backend: VcsBackend, base: RevisionInfo, target: RevisionInfo) -> bool:
+    """Whether base and target are the very same files, so one mypy run serves both."""
+    if base.commit_id != target.commit_id:
+        return False
+    return not (target.is_working_copy and backend.has_uncommitted_changes())
+
+
+def _runs_in_parallel(choice: bool | None, target: RevisionInfo) -> bool:
+    """Run both sides at once? By default when there are cores to spare: two mypy processes
+    also take twice the memory, and a 2-vCPU CI runner gains little from it.
+
+    Only with the working copy as target: two checkouts at once would also mean two
+    concurrent `git worktree add` / `jj` operations on one repository.
+    """
+    if not target.is_working_copy:
+        return False
+    if choice is not None:
+        return choice
+    return (os.cpu_count() or 1) >= _PARALLEL_MIN_CPUS
+
+
+#: Cores needed before both sides run at once by default.
+_PARALLEL_MIN_CPUS = 4
+
+
+def _write_step_summary(result: DiffResult, errors: Console) -> None:
+    """Append the report to the job summary GitHub Actions shows on the run page."""
+    target = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not target:
+        return
+    try:
+        with open(target, "a", encoding="utf-8") as handle:
+            handle.write(step_summary(result))
+    except OSError as failure:
+        errors.print(Text(f"warning: could not write the job summary: {failure}", style="yellow"))
 
 
 def _clean_cache(console: Console, cache_dir: Path | None) -> None:
@@ -375,15 +474,33 @@ def _resolve_vcs(name: str, skip_version_check: bool) -> ToolInfo:
 
 def _resolve_revisions(
     backend: VcsBackend, base: str | None, to: str | None, tip: bool
-) -> tuple[RevisionInfo, RevisionInfo]:
-    """Resolve the target first: the base is always derived from it, never from HEAD/@."""
+) -> tuple[RevisionInfo, RevisionInfo, str]:
+    """The base, the target, and how the base was chosen.
+
+    The target is resolved first: the base is always derived from it, never from HEAD/@.
+    """
     target = backend.working_copy() if to is None else backend.resolve(to)
 
     if base is None:
+        ci_branch = _ci_target_branch()
+        if ci_branch:
+            # A pull-request job: the branch it merges into is the base, not the "latest pushed
+            # ancestor" — in CI everything is pushed, so that would be HEAD itself.
+            resolved = backend.resolve_base(backend.remote_branch(ci_branch), target, tip=False)
+            return resolved, target, f"fork point with {ci_branch} (GITHUB_BASE_REF)"
         # The default base is the latest pushed named ancestor, which is already a fork point.
-        return backend.default_base(target), target
+        resolved = backend.default_base(target)
+        return resolved, target, backend.base_reason
 
-    return backend.resolve_base(base, target, tip), target
+    resolved = backend.resolve_base(base, target, tip)
+    return resolved, target, backend.base_reason
+
+
+def _ci_target_branch() -> str:
+    """The branch a GitHub Actions pull-request job merges into, or ""."""
+    if os.environ.get("GITHUB_ACTIONS") != "true":
+        return ""
+    return os.environ.get("GITHUB_BASE_REF", "").strip()
 
 
 class _EnvironmentProbe:
@@ -554,6 +671,8 @@ def _messages_for(
     console: Console,
     verbose: bool,
     activity: Activity,
+    role: str,
+    location: str,
 ) -> _Checked:
     """Run mypy for one revision, using the cache when the revision is immutable."""
     what = "working copy" if revision.is_working_copy else revision.short_id
@@ -564,7 +683,7 @@ def _messages_for(
     fingerprint = inspected.fingerprint if inspected is not None and cache.enabled else None
     if not revision.is_working_copy and cache.enabled and fingerprint is None and verbose:
         # Without knowing what is installed, a cached base could be from another environment.
-        console.print("[dim]result cache off: could not inspect mypy's environment[/dim]")
+        _trace(console, "result cache off: could not inspect mypy's environment")
     if fingerprint is not None:
         cache_key = cache.key(
             revision.commit_id,
@@ -576,7 +695,7 @@ def _messages_for(
         cached = cache.load_entry(cache_key)
         if cached is not None:
             if verbose:
-                console.print(f"[dim]cache hit for {revision.short_id}[/dim]")
+                _trace(console, f"cache hit for {revision.short_id}")
             activity.detail(f"Checking {what} (cached)")
             return _Checked(*cached)
 
@@ -591,7 +710,7 @@ def _messages_for(
             activity.detail(f"Checking out {what}")
             checkout = stack.enter_context(backend.worktree(revision))
             if verbose:
-                console.print(f"[dim]checked out {revision.short_id} into {checkout}[/dim]")
+                _trace(console, f"checked out {revision.short_id} into {checkout}")
             workdir = project.directory_in(checkout)
             if not workdir.is_dir():
                 raise MypyDiffError(
@@ -602,9 +721,7 @@ def _messages_for(
                 import_dirs = repository_import_dirs(inspected, project.root)
                 run_env = checkout_environment(import_dirs, project.root, checkout)
                 if verbose and import_dirs:
-                    console.print(
-                        f"[dim]importing {', '.join(import_dirs)} from the checkout[/dim]"
-                    )
+                    _trace(console, f"importing {', '.join(import_dirs)} from the checkout")
 
         activity.detail(f"Running mypy on {what}")
 
@@ -616,7 +733,7 @@ def _messages_for(
             mypy_args
             if checkout is None
             else move_targets_into(mypy_args, project.root, checkout, prefix),
-            cache.mypy_cache_dir(revision, stack, project.subdir),
+            cache.mypy_cache_dir(role, stack, location),
             prog=f"mypy-diff-{backend.name}",
             what=_describe(revision),
             env=run_env,
@@ -630,10 +747,10 @@ def _messages_for(
             _refuse_working_copy_reads(reads, revision)
 
     if verbose and run.skipped_lines:
-        console.print(f"[dim]skipped {run.skipped_lines} non-JSON line(s) from mypy[/dim]")
+        _trace(console, f"skipped {run.skipped_lines} non-JSON line(s) from mypy")
     if verbose:
         for path in run.dropped_targets:
-            console.print(f"[dim]{path} does not exist in {what}: checked without it[/dim]")
+            _trace(console, f"{path} does not exist in {what}: checked without it")
 
     messages = tuple(_repo_paths(run.messages, project))
     dropped = run.dropped_targets
@@ -686,6 +803,12 @@ def _diff(
     )
 
 
+def _trace(console: Console, text: str) -> None:
+    """A --verbose line, on stderr. Text, not markup: it quotes commit subjects and paths, and
+    rich would eat anything bracketed — or fail on a stray closing tag."""
+    console.print(Text(text, style="dim"))
+
+
 def _print_verbose_header(
     console: Console,
     backend: VcsBackend,
@@ -695,13 +818,13 @@ def _print_verbose_header(
     mypy_source: str,
     project: Project,
 ) -> None:
-    console.print(f"[dim]base   {base_rev.commit_id}  {base_rev.label()}[/dim]")
-    console.print(f"[dim]target {target_rev.commit_id}  {target_rev.label()}[/dim]")
+    _trace(console, f"base   {base_rev.commit_id}  {base_rev.label()}")
+    _trace(console, f"target {target_rev.commit_id}  {target_rev.label()}")
     command = " ".join(mypy.command)
-    console.print(f"[dim]mypy   {command}  ({mypy_source}, {mypy.display_version})[/dim]")
-    console.print(f"[dim]in     {project.subdir}[/dim]")
+    _trace(console, f"mypy   {command}  ({mypy_source}, {mypy.display_version})")
+    _trace(console, f"in     {project.subdir}")
     for command in backend.command_log():
-        console.print(f"[dim]$ {command}[/dim]")
+        _trace(console, f"$ {command}")
 
 
 def _print_doctor(
@@ -711,14 +834,63 @@ def _print_doctor(
     mypy: ToolInfo,
     mypy_source: str,
     project: Project,
+    backend: VcsBackend,
+    cache: ResultCache,
+    revisions: tuple[str | None, str | None, bool],
 ) -> None:
+    """Everything a run would use, and what would go wrong with it — without running mypy."""
+
+    def row(name: str, value: str) -> None:
+        console.print(Text(f"  {name:<15}  {value}"))
+
     console.print(f"mypy-diff {__version__}")
-    console.print(f"  repository root  {project.root}")
-    console.print(f"  {'project':<15}  {project.subdir}")
-    console.print(f"  {vcs_name:<15}  {vcs_tool.display_version}  ({vcs_tool.command[0]})")
-    console.print(f"  {'mypy':<15}  {mypy.display_version}  ({' '.join(mypy.command)})")
-    console.print(f"  {'mypy found via':<15}  {mypy_source}")
-    console.print(f"  {'python':<15}  {sys.version.split()[0]}")
+    row("repository root", str(project.root))
+    row("project", project.subdir)
+    row(vcs_name, f"{vcs_tool.display_version}  ({vcs_tool.command[0]})")
+    row("mypy", f"{mypy.display_version}  ({' '.join(mypy.command)})")
+    row("mypy found via", mypy_source)
+    row("python", sys.version.split()[0])
+
+    config = mypy_config_file(project.directory, project.root)
+    if config is None:
+        row("mypy config", "none in the repository (mypy may use a user-level config)")
+    else:
+        row("mypy config", config.relative_to(project.root).as_posix())
+    targets = configured_targets(config) if config is not None else []
+    row("targets", ", ".join(targets) if targets else "none configured: pass them after `--`")
+
+    base, to, tip = revisions
+    try:
+        base_rev, target_rev, reason = _resolve_revisions(backend, base, to, tip)
+    except MypyDiffError as failure:
+        row("base", f"cannot be determined: {failure.message}")
+    else:
+        row("base", f"{base_rev.label()}  ({reason})")
+        row("target", target_rev.label())
+    if backend.is_shallow():
+        row("shallow clone", "yes: a fork point outside the fetched history cannot be found")
+
+    size = cache.size() if cache.enabled else 0
+    row("cache", f"{cache.directory}  ({_human_size(size)})" if cache.enabled else "disabled")
+
+    for warning in [*backend.warnings, *_environment_warnings(mypy_source, project)]:
+        console.print(Text("  warning: ", style="bold yellow") + Text(warning))
+
+
+def _environment_warnings(mypy_source: str, project: Project) -> list[str]:
+    """An activated virtualenv wins over the project's own: say so when they differ."""
+    active = os.environ.get("VIRTUAL_ENV")
+    if mypy_source != "active virtualenv" or not active:
+        return []
+    for directory in (project.directory, project.root):
+        own = directory / ".venv"
+        if own.is_dir() and own.resolve() != Path(active).resolve():
+            return [
+                f"mypy comes from the activated virtualenv {active}, not from the project's own "
+                f"{own}. If that is another project's environment, deactivate it or pass "
+                "--mypy-cmd."
+            ]
+    return []
 
 
 def jj_main() -> None:

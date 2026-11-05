@@ -80,6 +80,11 @@ Check your setup at any time:
 mypy-diff-jj --doctor
 ```
 
+It prints the tools it found and everything a run would use, without running mypy: the mypy
+config it would read and the targets that config names (or that it names none), the base it would
+compare against and why, whether the clone is shallow, and the cache directory with its size. It
+warns when an activated virtualenv overrides the project's own `.venv`.
+
 ## Usage
 
 ```bash
@@ -188,9 +193,11 @@ the run fails.
       --no-progress      Do not show the progress indicator.
       --exit-zero        Always exit 0, even when new errors appear.
       --fail-on-changed  Also exit 1 when a pre-existing error changed its message.
+      --parallel / --no-parallel
+                         Run mypy on base and working copy at once. Default: with 4+ CPUs.
       --skip-version-check
       --doctor           Print detected tools and versions, then exit.
-  -v, --verbose          Show resolved revisions and every command run.
+  -v, --verbose          Show resolved revisions and every command run (on stderr).
       --version
 ```
 
@@ -202,8 +209,11 @@ that could not find mypy), or an internal crash. None of them is ever read as "n
 
 ### Progress
 
-Two mypy runs take a while, so an interactive run shows which step it is on and how long it has
-been going:
+Two mypy runs take a while. With 4 or more CPUs they run at the same time — the working copy in
+place, the base in its checkout — which nearly halves the wall-clock time of a cold run (3.8 s
+instead of 7.2 s on mypy-diff's own code); `--no-parallel` runs them one after the other, which
+needs half the memory. An interactive run shows which step it is on and how long it has been
+going:
 
 ```
 ⠹ [3/5] Running mypy on 4c37600f 0:00:12
@@ -223,17 +233,48 @@ and under `--no-progress`.
   with:
     fetch-depth: 0   # the fork point must be in the history
 - run: uv tool install mypy-diff
-- run: mypy-diff-git -b origin/${{ github.base_ref }} --format github -- src
+- run: mypy-diff-git --format github -- src
 ```
 
-The job fails only when the branch *adds* type errors; the pre-existing backlog is ignored, and
-`--format github` turns each new error into an inline annotation on the pull request.
+The job fails only when the branch *adds* type errors; the pre-existing backlog is ignored.
+
+- In a pull-request job (`GITHUB_BASE_REF` is set), the default base is the fork point with the
+  branch the pull request merges into. Outside CI the default is the latest pushed ancestor —
+  which in CI, where everything is pushed, would be the commit itself. `-b` still wins.
+- `--format github` turns each new error into an inline annotation, and each changed one into a
+  notice on its line. A fixed error's line number belongs to the base revision, so it becomes a
+  notice on the file only.
+- With `--format github`, the verdict also goes to the log (stderr), and a report — counts plus
+  the errors themselves — to the job summary (`$GITHUB_STEP_SUMMARY`).
+
+When base and target are the same tree (everything pushed, nothing changed), mypy runs once, and a
+warning says there is nothing to compare.
 
 A shallow clone (the `actions/checkout` default) usually lacks the fork point. mypy-diff then
 stops with an error instead of silently comparing against the tip of `main`, which would report
 everything `main` did since you branched as your change. The one shallow case that works is a
 pull-request merge commit checked against its own base branch: its first parent is recorded in
 the commit itself.
+
+### JSON output
+
+`--format json` prints one object, schema version 1. Every key is always present:
+
+| Key | |
+|---|---|
+| `schema_version` | `1`; bumped on any incompatible change |
+| `base`, `target` | `commit_id`, `short_id`, `change_id` (jj), `refs`, `description`, `working_copy`; the base also has `reason`, how it was chosen |
+| `summary` | counts: `new`, `fixed`, `changed`, `unchanged`, `net` — always all of them |
+| `new`, `fixed` | diagnostics: `path` (repository-relative), `line`, `column` (0-based, as mypy reports it), `severity`, `message`, `code`, `hint`, `notes` |
+| `changed` | pairs of `{"old": …, "new": …}` |
+| `unchanged` | the list with `--show-unchanged`, else `null` |
+| `only` | the `--only` filter; filtered-out lists are empty, never missing |
+| `stats` | `moved`, `moved_between_files`: unchanged errors that matched at another position |
+| `incomplete` | why the comparison is partial (a blocking error), else `null` |
+
+Human output prints columns 1-based, the way mypy does, so `file:line:col` opens at the right
+place. Everything that is not the report — `--verbose` tracing, warnings, the progress indicator
+— goes to stderr, and the JSON is written without any styling, whatever `FORCE_COLOR` says.
 
 ## How matching works
 
@@ -318,17 +359,22 @@ Two caches live side by side, in a per-user directory from
   resolves to a concrete commit, so repeat runs skip that analysis entirely. The dirty working
   copy is never cached, and neither is a run that did not finish cleanly. Tiny — a few hundred
   bytes per entry.
-- **Incremental mypy cache** — what mypy itself keeps, one directory per revision, handed over
-  with `--cache-dir`. This keeps the two runs from invalidating each other and leaves your own
-  `.mypy_cache` untouched. This is the part with real weight: **roughly 2 MB per revision.**
+- **Incremental mypy cache** — what mypy itself keeps, handed over with `--cache-dir`: one
+  directory per project for the base side and one for the target side. The two never share, so
+  the runs do not invalidate each other, and your own `.mypy_cache` is left untouched. Each side
+  keeps its directory from one run to the next, whatever commit it checks — mypy re-validates
+  every module by its content hash — and a side that has none yet starts from a copy of the
+  other's. So the first run after a commit, or against a new base, is warm instead of a full
+  analysis (on mypy-diff's own code: 1.6 s instead of 7.2 s). This is the part with real weight:
+  megabytes per side, growing with the size of the project and its dependencies.
 
 Both backends key on a git SHA, so `mypy-diff-jj` and `mypy-diff-git` share one cache.
 
 ### Retention
 
 By default the cache holds the **last 3 runs** and older entries are evicted automatically after
-each run (least-recently-used first). Since one run touches at most two revisions — the base and
-the target — that works out to at most 6 revision directories, or roughly 12 MB.
+each run (least-recently-used first): two result entries per run, and the incremental caches of
+the last 3 projects checked.
 
 Override it with an environment variable:
 

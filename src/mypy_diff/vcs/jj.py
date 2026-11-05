@@ -28,12 +28,12 @@ _TEMPLATE = (
 #: but the fork point is still pushed.
 _DEFAULT_BASE_REVSETS = (
     # The nearest pushed ancestor — the common case.
-    "heads({ancestors} & ::remote_bookmarks())",
+    ("heads({ancestors} & ::remote_bookmarks())", "nearest pushed ancestor"),
     # Nothing pushed yet: the nearest locally named ancestor (not the target itself).
-    "heads({proper} & (bookmarks() | tags()))",
+    ("heads({proper} & (bookmarks() | tags()))", "nearest bookmarked ancestor"),
     # Where the target forked from the trunk. `trunk()` alone may not be an ancestor at all.
-    "heads({proper} & ::trunk())",
-    "{parent}",
+    ("heads({proper} & ::trunk())", "fork point with trunk()"),
+    ("{parent}", "parent revision"),
 )
 
 _WORKSPACE_PREFIX = "mypy-diff-"
@@ -66,6 +66,8 @@ class JjBackend:
         self.notes: list[str] = []
         #: Shown always: something about the comparison the user should know.
         self.warnings: list[str] = []
+        #: How the last base was chosen, for the report header.
+        self.base_reason = ""
 
     # ---------------------------------------------------------------- basics
 
@@ -161,7 +163,7 @@ class JjBackend:
         else:
             proper = f"::({target.commit_id}-)"
             ancestors, parent = proper, f"{target.commit_id}-"
-        for template in _DEFAULT_BASE_REVSETS:
+        for template, reason in _DEFAULT_BASE_REVSETS:
             revset = template.format(ancestors=ancestors, proper=proper, parent=parent)
             # `trunk()` resolves to the root commit in a repo without a trunk; an empty tree
             # would report every single error as new.
@@ -169,6 +171,7 @@ class JjBackend:
             if found:
                 if self.verbose:
                     self.notes.append(f"Base resolved via revset `{revset}`.")
+                self.base_reason = reason
                 if len(found) > 1:
                     # A merge: several lines of pushed (or named) work meet below @.
                     self.warnings.append(
@@ -186,7 +189,20 @@ class JjBackend:
     def resolve_base(self, revspec: str, target: RevisionInfo, tip: bool) -> RevisionInfo:
         """The base for ``-b REVSPEC``: its fork point with ``target``, or its tip with --tip."""
         rev = self.resolve(revspec)
+        self.base_reason = f"tip of {revspec}" if tip else f"fork point with {revspec}"
         return rev if tip else self.fork_point(rev, target)
+
+    def is_shallow(self) -> bool:
+        """jj does not make shallow clones of its own; the git store would say otherwise."""
+        return False
+
+    def has_uncommitted_changes(self) -> bool:
+        """Never: the up-front snapshot made @ exactly what is on disk."""
+        return False
+
+    def remote_branch(self, name: str) -> str:
+        """How to name the remote copy of a branch, e.g. the CI's target branch."""
+        return f'remote_bookmarks(exact:"{name}", exact:"origin")'
 
     def fork_point(self, rev: RevisionInfo, target: RevisionInfo | None = None) -> RevisionInfo:
         """The common ancestor of ``rev`` and ``target`` (default: the working copy, ``@``).

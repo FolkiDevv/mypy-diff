@@ -82,6 +82,17 @@ def isolated_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return directory
 
 
+@pytest.fixture(autouse=True)
+def outside_ci(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The suite itself runs in GitHub Actions; mypy-diff reads its variables.
+
+    Without this, every CLI test without `-b` would compare against GITHUB_BASE_REF, and write
+    into the real job summary.
+    """
+    for name in ("GITHUB_ACTIONS", "GITHUB_BASE_REF", "GITHUB_STEP_SUMMARY"):
+        monkeypatch.delenv(name, raising=False)
+
+
 @pytest.fixture
 def short_tmp_path() -> Iterator[Path]:
     """A temp directory with a *short* path.

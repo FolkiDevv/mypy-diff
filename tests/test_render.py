@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import dataclasses
 import io
 import json
 
 from rich.console import Console
 
 from mypy_diff.models import DiffResult, MypyMessage, RevisionInfo, Severity
-from mypy_diff.render import Only, OutputFormat, render
+from mypy_diff.render import Only, OutputFormat, render, step_summary
 
 BASE = RevisionInfo(
     commit_id="a" * 40,
@@ -46,8 +47,8 @@ def test_pretty_shows_both_sections_and_a_summary() -> None:
     output = capture(RESULT, OutputFormat.PRETTY)
     assert "+ NEW (1)" in output
     assert "- FIXED (1)" in output
-    assert "+ src/app.py:42:4: error: Bad return  [return-value]" in output
-    assert "- src/app.py:10:4: error: Undefined name  [name-defined]" in output
+    assert "+ src/app.py:42:5: error: Bad return  [return-value]" in output
+    assert "- src/app.py:10:5: error: Undefined name  [name-defined]" in output
     assert "2 unchanged errors in 1 file" in output
     assert "Found 1 new, 1 fixed, 2 unchanged  (net 0)" in output
 
@@ -70,7 +71,7 @@ def test_pretty_reports_a_clean_diff() -> None:
 def test_show_unchanged_lists_them() -> None:
     output = capture(RESULT, OutputFormat.PRETTY, show_unchanged=True)
     assert "UNCHANGED (2)" in output
-    assert "src/app.py:7:4: error: Bad arg" in output
+    assert "src/app.py:7:5: error: Bad arg" in output
 
 
 def test_only_new_hides_the_fixed_section() -> None:
@@ -114,10 +115,14 @@ def test_json_is_machine_readable() -> None:
     assert payload["fixed"][0]["code"] == "name-defined"
 
 
-def test_json_respects_only() -> None:
+def test_json_respects_only_but_keeps_every_key() -> None:
+    """Consumers can rely on the keys; --only empties a list and says so."""
     payload = json.loads(capture(RESULT, OutputFormat.JSON, only=Only.NEW))
-    assert "new" in payload
-    assert "fixed" not in payload
+    assert payload["only"] == "new"
+    assert len(payload["new"]) == 1
+    assert payload["fixed"] == []
+    assert payload["changed"] == []
+    assert payload["summary"]["fixed"] == 1
 
 
 def test_github_annotations() -> None:
@@ -126,7 +131,8 @@ def test_github_annotations() -> None:
     assert (
         "::error file=src/app.py,line=42,col=5,title=mypy [return-value] (new)::Bad return"
     ) in output
-    assert "::notice file=src/app.py,line=10,col=5,title=mypy [name-defined] (fixed)::" in output
+    # A fixed error's line is the base revision's; on the PR head it would point elsewhere.
+    assert "::notice file=src/app.py,title=mypy [name-defined] (fixed)::" in output
 
 
 def test_github_escapes_newlines_in_messages() -> None:
@@ -170,7 +176,7 @@ CHANGED = DiffResult(
 def test_pretty_shows_changed_errors_with_their_old_text() -> None:
     output = capture(CHANGED, OutputFormat.PRETTY)
     assert "~ CHANGED (1)" in output
-    assert '~ src/app.py:4:4: error: Argument 1 has type "str"; expected "float"' in output
+    assert '~ src/app.py:4:5: error: Argument 1 has type "str"; expected "float"' in output
     assert '~   was: line 3: Argument 1 has type "str"; expected "int"' in output
     assert "1 changed" in output
     assert "No change" not in output
@@ -192,3 +198,81 @@ def test_github_reports_changed_errors_as_notices() -> None:
 
 def test_only_new_hides_changed_errors() -> None:
     assert "CHANGED" not in capture(CHANGED, OutputFormat.PRETTY, only=Only.NEW)
+
+
+# ------------------------------------------------------------------ JSON schema v1
+
+
+def test_json_carries_a_schema_version_and_stats() -> None:
+    payload = json.loads(capture(RESULT, OutputFormat.JSON))
+    assert payload["schema_version"] == 1
+    assert payload["stats"] == {"moved": 0, "moved_between_files": 0}
+    assert payload["unchanged"] is None
+    assert payload["incomplete"] is None
+
+
+def test_json_lists_unchanged_errors_on_request() -> None:
+    payload = json.loads(capture(RESULT, OutputFormat.JSON, show_unchanged=True))
+    assert [m["line"] for m in payload["unchanged"]] == [7, 9]
+
+
+def test_json_says_how_the_base_was_chosen() -> None:
+    explained = dataclasses.replace(RESULT, base_reason="fork point with main")
+    assert json.loads(capture(explained, OutputFormat.JSON))["base"]["reason"] == (
+        "fork point with main"
+    )
+
+
+def test_the_header_says_how_the_base_was_chosen() -> None:
+    explained = dataclasses.replace(RESULT, base_reason="fork point with main")
+    assert "(fork point with main)" in capture(explained, OutputFormat.PRETTY).splitlines()[0]
+
+
+def test_hints_are_printed_as_notes() -> None:
+    hinted = DiffResult(
+        base=BASE,
+        target=TARGET,
+        new=(
+            MypyMessage(
+                path="src/app.py",
+                line=1,
+                column=0,
+                severity=Severity.ERROR,
+                message='Library stubs not installed for "yaml"',
+                code="import-untyped",
+                hint='Hint: "python3 -m pip install types-PyYAML"',
+            ),
+        ),
+    )
+    output = capture(hinted, OutputFormat.PRETTY)
+    assert '+   note: Hint: "python3 -m pip install types-PyYAML"' in output
+
+
+# ------------------------------------------------------------------ GitHub workflow commands
+
+
+def test_github_escapes_percent_and_property_separators() -> None:
+    """GitHub decodes %25, %0D, %0A in messages, and also %3A, %2C in properties."""
+    tricky = DiffResult(
+        base=BASE,
+        target=TARGET,
+        new=(message(3, "misc", "100% sure, see %0A", path="src/a,b:c.py"),),
+    )
+    output = capture(tricky, OutputFormat.GITHUB)
+    assert "file=src/a%2Cb%3Ac.py," in output
+    assert output.rstrip().endswith("::100%25 sure, see %250A")
+
+
+def test_step_summary_has_the_verdict_and_the_errors() -> None:
+    summary = step_summary(RESULT)
+    assert summary.startswith("## mypy-diff")
+    assert "| 1 | 1 | 0 | 2 | +0 |" in summary
+    assert "src/app.py:42:5: error: Bad return  [return-value]" in summary
+    assert "<details open><summary>New errors (1)</summary>" in summary
+
+
+def test_step_summary_caps_long_lists() -> None:
+    many = DiffResult(
+        base=BASE, target=TARGET, new=tuple(message(n, "misc", f"e{n}") for n in range(1, 61))
+    )
+    assert "... and 10 more" in step_summary(many)

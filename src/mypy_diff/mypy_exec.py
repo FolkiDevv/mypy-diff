@@ -528,11 +528,24 @@ def parse_json_output(stdout: str, workdir: Path) -> tuple[tuple[MypyMessage, ..
             continue
 
         severity = Severity(raw.get("severity") or "error")
-        if severity is Severity.NOTE and messages:
-            # A note is elaboration on the diagnostic above it, not a diagnostic of its own.
-            pending_notes.append(str(raw["message"]))
-            messages[-1] = _with_notes(messages[-1], tuple(pending_notes))
-            continue
+        if severity is Severity.NOTE:
+            # mypy puts the notes that belong to a diagnostic into its `hint`. A separate note
+            # elaborates on the diagnostic above it only at that same place; elsewhere it is
+            # context ("In function ...", line -1) or a reveal_type(), and attaching it to an
+            # unrelated error — possibly in another file — would misattribute it. Such a note
+            # stays a message of its own: it is never diffed, but it still counts as output
+            # (a run with nothing but a reveal_type() exits 1 with one note).
+            previous = messages[-1] if messages else None
+            path = _normalize_path(raw.get("file") or "", workdir)
+            if (
+                previous is not None
+                and previous.severity is not Severity.NOTE
+                and previous.path == path
+                and previous.line == int(raw.get("line") or 0)
+            ):
+                pending_notes.append(str(raw["message"]))
+                messages[-1] = _with_notes(previous, tuple(pending_notes))
+                continue
 
         pending_notes = []
         messages.append(

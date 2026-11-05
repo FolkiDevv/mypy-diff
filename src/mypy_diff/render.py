@@ -31,8 +31,15 @@ class Only(StrEnum):
 
 
 def make_console(color: bool) -> Console:
-    # highlight=False and soft_wrap=True keep rich from reformatting mypy's own text.
-    return Console(highlight=False, soft_wrap=True, no_color=not color)
+    """The stdout console. highlight=False and soft_wrap=True keep rich from reformatting
+    mypy's own text.
+
+    Without colour there is no styling at all: ``no_color`` alone keeps bold and dim, and
+    FORCE_COLOR / TTY_COMPATIBLE in a CI environment would put escape codes into plain output.
+    """
+    if color:
+        return Console(highlight=False, soft_wrap=True)
+    return Console(highlight=False, soft_wrap=True, color_system=None)
 
 
 def render(
@@ -44,7 +51,9 @@ def render(
 ) -> None:
     match output_format:
         case OutputFormat.JSON:
-            console.print_json(json.dumps(_as_json(result, only)))
+            # Straight to the stream, not through rich: whatever the environment says about
+            # colours, a consumer must get JSON and nothing else.
+            console.file.write(json.dumps(_as_json(result, only, show_unchanged), indent=2) + "\n")
         case OutputFormat.GITHUB:
             _render_github(result, console, only)
         case _:
@@ -59,6 +68,8 @@ def _render_human(result: DiffResult, console: Console, only: Only, show_unchang
     header.append("mypy-diff", style="bold")
     header.append("  base: ", style="dim")
     header.append(result.base.label())
+    if result.base_reason:
+        header.append(f"  ({result.base_reason})", style="dim")
     console.print(header)
     console.print(Text("             to: ", style="dim") + Text(result.target.label()))
     console.print()
@@ -99,7 +110,7 @@ def _render_section(
     console.print(Text(f"{title} ({len(messages)})", style=f"bold {style}"))
     for message in messages:
         console.print(Text(f"{prefix} {message.format()}", style=style))
-        for note in message.notes:
+        for note in message.note_lines():
             console.print(Text(f"{prefix}   note: {note}", style="dim"))
     console.print()
 
@@ -114,6 +125,11 @@ def _render_changed(console: Console, pairs: tuple[tuple[MypyMessage, MypyMessag
         was = f"line {old.line}: " if old.line != new.line else ""
         console.print(Text(f"~   was: {was}{old.message}", style="dim"))
     console.print()
+
+
+def summary_text(result: DiffResult) -> Text:
+    """The one-line verdict, for any format that wants to add it (on stderr, say)."""
+    return _summary(result)
 
 
 def _summary(result: DiffResult) -> Text:
@@ -140,10 +156,19 @@ def _plural(count: int, word: str) -> str:
 # ------------------------------------------------------------------ machine output
 
 
-def _as_json(result: DiffResult, only: Only) -> dict[str, Any]:
+#: Bumped on any incompatible change to the JSON output.
+JSON_SCHEMA_VERSION = 1
+
+
+def _as_json(result: DiffResult, only: Only, show_unchanged: bool = False) -> dict[str, Any]:
+    """The JSON report. Every key is always present, whatever the options: ``--only`` empties a
+    list rather than dropping it, and says so in ``only``; ``unchanged`` is null unless
+    ``--show-unchanged`` asked for the list."""
     payload: dict[str, Any] = {
+        "schema_version": JSON_SCHEMA_VERSION,
+        "only": only.value,
         "incomplete": result.incomplete or None,
-        "base": _revision_json(result.base),
+        "base": {**_revision_json(result.base), "reason": result.base_reason or None},
         "target": _revision_json(result.target),
         "summary": {
             "new": len(result.new),
@@ -152,15 +177,17 @@ def _as_json(result: DiffResult, only: Only) -> dict[str, Any]:
             "unchanged": len(result.unchanged),
             "net": len(result.new) - len(result.fixed),
         },
+        "stats": {
+            "moved": result.stats.get("moved", 0),
+            "moved_between_files": result.stats.get("moved_between_files", 0),
+        },
+        "new": [m.to_json() for m in result.new] if only in (Only.ALL, Only.NEW) else [],
+        "fixed": [m.to_json() for m in result.fixed] if only in (Only.ALL, Only.FIXED) else [],
+        "changed": [{"old": old.to_json(), "new": new.to_json()} for old, new in result.changed]
+        if only is Only.ALL
+        else [],
+        "unchanged": [m.to_json() for m in result.unchanged] if show_unchanged else None,
     }
-    if only in (Only.ALL, Only.NEW):
-        payload["new"] = [m.to_json() for m in result.new]
-    if only in (Only.ALL, Only.FIXED):
-        payload["fixed"] = [m.to_json() for m in result.fixed]
-    if only is Only.ALL:
-        payload["changed"] = [
-            {"old": old.to_json(), "new": new.to_json()} for old, new in result.changed
-        ]
     return payload
 
 
@@ -176,30 +203,103 @@ def _revision_json(revision: Any) -> dict[str, Any]:
 
 
 def _render_github(result: DiffResult, console: Console, only: Only) -> None:
-    """GitHub Actions annotations. Fixed errors become notices so they show up too."""
+    """GitHub Actions workflow commands.
+
+    New errors are annotations on their line. Changed ones too, as notices: their line is in
+    the target. A fixed error's line number is the *base* revision's, which on the pull request's
+    head points at unrelated code (or at a file that is gone), so it becomes a notice on the file
+    alone. The full lists go to the job summary, see :func:`step_summary`.
+    """
     if result.incomplete:
-        console.print(f"::warning title=mypy-diff::{result.incomplete}", markup=False)
+        console.print(f"::warning title=mypy-diff::{_data(result.incomplete)}", markup=False)
     if only in (Only.ALL, Only.NEW):
         for message in result.new:
             console.print(_annotation("error", message, "new"), markup=False, highlight=False)
     if only in (Only.ALL, Only.FIXED):
         for message in result.fixed:
-            console.print(_annotation("notice", message, "fixed"), markup=False, highlight=False)
+            console.print(
+                _annotation("notice", message, "fixed", with_position=False),
+                markup=False,
+                highlight=False,
+            )
     if only is Only.ALL:
         for old, new in result.changed:
             changed = dataclasses.replace(new, message=f"{new.message}\nwas: {old.message}")
             console.print(_annotation("notice", changed, "changed"), markup=False, highlight=False)
 
 
-def _annotation(level: str, message: MypyMessage, kind: str) -> str:
-    parts = [f"file={message.path}", f"line={message.line}"]
-    if message.column is not None:
-        # mypy columns are 0-based; GitHub annotations are 1-based.
-        parts.append(f"col={message.column + 1}")
-    if message.code:
-        parts.append(f"title=mypy [{message.code}] ({kind})")
-    else:
-        parts.append(f"title=mypy ({kind})")
-    # Newlines would terminate the annotation early.
-    body = message.message.replace("\n", "%0A")
-    return f"::{level} {','.join(parts)}::{body}"
+def _annotation(level: str, message: MypyMessage, kind: str, with_position: bool = True) -> str:
+    parts = [f"file={_property(message.path)}"]
+    if with_position:
+        parts.append(f"line={message.line}")
+        if message.column is not None and message.column >= 0:
+            # mypy columns are 0-based; GitHub annotations are 1-based.
+            parts.append(f"col={message.column + 1}")
+    title = f"mypy [{message.code}] ({kind})" if message.code else f"mypy ({kind})"
+    parts.append(f"title={_property(title)}")
+    body = message.message
+    notes = message.note_lines()
+    if notes:
+        body += "\n" + "\n".join(f"note: {note}" for note in notes)
+    return f"::{level} {','.join(parts)}::{_data(body)}"
+
+
+def _data(text: str) -> str:
+    """Escape a workflow command's message, as GitHub's own toolkit does."""
+    return text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+
+def _property(text: str) -> str:
+    """Escape a workflow command property: `,` and `:` would end it early."""
+    return _data(text).replace(":", "%3A").replace(",", "%2C")
+
+
+# ------------------------------------------------------------------ job summary
+
+#: The job summary lists at most this many errors per section; the rest is counted.
+_SUMMARY_LIMIT = 50
+
+
+def step_summary(result: DiffResult) -> str:
+    """Markdown for `$GITHUB_STEP_SUMMARY`: the verdict, then the errors themselves."""
+    net = len(result.new) - len(result.fixed)
+    lines = [
+        "## mypy-diff",
+        "",
+        f"Base: `{result.base.short_id}` {_markdown_label(result.base)}",
+        "",
+        "| New | Fixed | Changed | Unchanged | Net |",
+        "|---:|---:|---:|---:|---:|",
+        f"| {len(result.new)} | {len(result.fixed)} | {len(result.changed)} "
+        f"| {len(result.unchanged)} | {net:+d} |",
+        "",
+    ]
+    if result.incomplete:
+        lines += [f"> [!WARNING]\n> {result.incomplete}", ""]
+    for title, messages, open_ in (
+        ("New errors", result.new, True),
+        ("Fixed errors", result.fixed, False),
+    ):
+        if not messages:
+            continue
+        lines.append(
+            f"<details{' open' if open_ else ''}><summary>{title} ({len(messages)})</summary>\n"
+        )
+        lines.append("```")
+        lines += [message.format() for message in messages[:_SUMMARY_LIMIT]]
+        if len(messages) > _SUMMARY_LIMIT:
+            lines.append(f"... and {len(messages) - _SUMMARY_LIMIT} more")
+        lines += ["```", "</details>", ""]
+    if result.changed:
+        lines.append(f"<details><summary>Changed errors ({len(result.changed)})</summary>\n")
+        lines.append("```")
+        for old, new in result.changed[:_SUMMARY_LIMIT]:
+            lines += [new.format(), f"  was: {old.message}"]
+        lines += ["```", "</details>", ""]
+    return "\n".join(lines) + "\n"
+
+
+def _markdown_label(revision: Any) -> str:
+    description = revision.description.replace("`", "'")
+    refs = " ".join(revision.refs)
+    return " ".join(part for part in (refs, f"— {description}" if description else "") if part)

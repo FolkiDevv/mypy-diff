@@ -6,10 +6,11 @@ Two separate things live under the same directory:
   any revision that resolves to a concrete commit. A commit is immutable, but the environment
   mypy resolves imports in is not, so the key also carries a fingerprint of that environment.
   The dirty working copy is never cached.
-* **Incremental mypy cache** — ``<dir>/mypy-cache/<commit16>[-wc]``, handed to mypy via
-  ``--cache-dir``. One per run so the two runs never invalidate each other, and so the
-  developer's own ``.mypy_cache`` is left alone. This is the part that takes real space
-  (~2 MB per revision), so it is what retention is really about.
+* **Incremental mypy cache** — ``<dir>/mypy-cache/<project16>/{base,target}``, handed to mypy
+  via ``--cache-dir``. One per side of a run, so the two runs never invalidate each other, and
+  so the developer's own ``.mypy_cache`` is left alone; kept across commits, because mypy
+  re-validates every module by content hash. This is the part that takes real space (megabytes
+  per side, growing with the project), so it is what retention is really about.
 
 Both backends key on a git SHA, so the cache is shared between `mypy-diff-jj` and
 `mypy-diff-git` for the same repository.
@@ -29,7 +30,7 @@ from pathlib import Path
 from platformdirs import user_cache_dir
 
 from . import __version__
-from .models import MypyMessage, RevisionInfo
+from .models import MypyMessage
 
 #: Bumped whenever a cached result may no longer be what this version would compute for the same
 #: key. 5: the base imports the repository's packages from its own checkout.
@@ -154,8 +155,15 @@ class ResultCache:
 
     # ----------------------------------------------------------- incremental cache
 
-    def mypy_cache_dir(self, revision: RevisionInfo, stack: ExitStack, project: str = ".") -> Path:
-        """Directory to hand mypy as ``--cache-dir`` for this revision.
+    def mypy_cache_dir(self, role: str, stack: ExitStack, location: str) -> Path:
+        """Directory to hand mypy as ``--cache-dir`` for one side of a run.
+
+        ``role`` is "base" or "target"; ``location`` identifies the repository and project (see
+        :func:`location`). The two sides never share a directory, so they never invalidate each
+        other. Across runs, though, each side keeps its directory, whatever commit it checks:
+        mypy validates every module by its content hash, so the cache of the previous base is a
+        warm start for the next one. Keyed by commit, every commit, amend or push used to mean a
+        cold, full mypy run.
 
         With caching disabled this is a temporary directory tied to ``stack``, so ``--no-cache``
         really means *nothing is left behind* — not just "skip the result cache". mypy is never
@@ -166,21 +174,40 @@ class ResultCache:
             temporary = tempfile.TemporaryDirectory(prefix="mypy-diff-", ignore_cleanup_errors=True)
             return Path(stack.enter_context(temporary))
 
-        # The working copy's commit_id is its *parent's*. Without this suffix, a run whose base
-        # is HEAD would point both runs at one directory and thrash it.
-        suffix = "-wc" if revision.is_working_copy else ""
-        if project != ".":
-            # Projects of one monorepo commit must not share an incremental cache either.
-            suffix = f"-{hashlib.sha256(project.encode('utf-8')).hexdigest()[:8]}{suffix}"
-        directory = self.directory / _MYPY_CACHE_SUBDIR / f"{revision.commit_id[:16]}{suffix}"
+        place = self._place(location)
+        directory = place / role
         # mypy writes deep inside, which never updates the top directory's mtime — and mtime is
         # what retention sorts on. Stamp it explicitly on every use.
         try:
             directory.mkdir(parents=True, exist_ok=True)
             _touch(directory)
+            _touch(place)
         except OSError:
             pass
         return directory
+
+    def seed(self, location: str) -> None:
+        """Start a side that has no incremental cache yet from the other side's.
+
+        The first base run after the target has run (or the other way round) then finds most
+        modules unchanged. Called before either side runs, never while one does: copying a
+        cache mypy is writing could copy it half-written.
+        """
+        if not self.enabled:
+            return
+        place = self._place(location)
+        for role, other in (("base", "target"), ("target", "base")):
+            source, destination = place / other, place / role
+            if destination.exists() or not source.is_dir():
+                continue
+            try:
+                shutil.copytree(source, destination)
+            except OSError:
+                shutil.rmtree(destination, ignore_errors=True)
+
+    def _place(self, location: str) -> Path:
+        digest = hashlib.sha256(location.encode("utf-8")).hexdigest()[:16]
+        return self.directory / _MYPY_CACHE_SUBDIR / digest
 
     # ---------------------------------------------------------------- maintenance
 
@@ -199,12 +226,23 @@ class ResultCache:
         _trim(sorted(self.directory.glob("*.json"), key=_mtime, reverse=True)[budget:])
         mypy_cache = self.directory / _MYPY_CACHE_SUBDIR
         if mypy_cache.is_dir():
+            # One directory per project (holding its base and target caches): keep the projects
+            # of the last `limit` runs. Directories of the old per-commit layout are the oldest
+            # and go first.
             stale = sorted(
                 (child for child in mypy_cache.iterdir() if child.is_dir()),
                 key=_mtime,
                 reverse=True,
-            )[budget:]
+            )[limit:]
             _trim(stale)
+
+    def size(self) -> int:
+        """Bytes this tool's content takes up in the cache directory."""
+        if not self.directory.is_dir():
+            return 0
+        total = sum(_size(path) for path in self.directory.glob("*.json"))
+        mypy_cache = self.directory / _MYPY_CACHE_SUBDIR
+        return total + (_size(mypy_cache) if mypy_cache.is_dir() else 0)
 
     def clear(self) -> int:
         """Delete everything this tool created here and return the bytes freed.
@@ -265,3 +303,8 @@ def _size(path: Path) -> int:
             with contextlib.suppress(OSError):
                 total += child.stat().st_size
     return total
+
+
+def location(root: Path, project: str) -> str:
+    """What identifies one project's incremental caches: its repository and subdirectory."""
+    return f"{root.resolve()}\0{project}"

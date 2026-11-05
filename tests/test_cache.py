@@ -13,6 +13,7 @@ from mypy_diff.cache import (
     KEEP_ENV_VAR,
     ResultCache,
     keep_runs,
+    location,
 )
 from mypy_diff.models import MypyMessage, RevisionInfo, Severity
 
@@ -118,10 +119,13 @@ def test_corrupt_entry_is_a_miss_not_a_crash(tmp_path: Path) -> None:
 # ------------------------------------------------------------------ mypy cache dir
 
 
+HERE = location(Path("/work/repo"), ".")
+
+
 def test_mypy_cache_dir_is_ephemeral_when_disabled(tmp_path: Path) -> None:
     subject = cache(tmp_path, enabled=False)
     with ExitStack() as stack:
-        directory = subject.mypy_cache_dir(revision(), stack)
+        directory = subject.mypy_cache_dir("base", stack, HERE)
         assert directory.exists()
         # Nothing under the real cache directory.
         assert subject.directory not in directory.parents
@@ -129,38 +133,60 @@ def test_mypy_cache_dir_is_ephemeral_when_disabled(tmp_path: Path) -> None:
     assert not directory.exists()
 
 
-def test_mypy_cache_dir_separates_working_copy_from_its_parent(tmp_path: Path) -> None:
-    """A working copy carries its *parent's* commit id.
-
-    When everything is pushed, base == HEAD, and without the suffix both runs would share one
-    directory and thrash each other's incremental cache.
-    """
+def test_mypy_cache_dir_separates_the_two_sides(tmp_path: Path) -> None:
+    """Base and target must not share a directory, or they would invalidate each other."""
     subject = cache(tmp_path)
     with ExitStack() as stack:
-        base = subject.mypy_cache_dir(revision(), stack)
-        working = subject.mypy_cache_dir(revision(working_copy=True), stack)
+        base = subject.mypy_cache_dir("base", stack, HERE)
+        target = subject.mypy_cache_dir("target", stack, HERE)
 
-    assert base != working
-    assert working.name.endswith("-wc")
+    assert base != target
+    assert base.parent == target.parent
 
 
-def test_mypy_cache_dir_separates_projects(tmp_path: Path) -> None:
+def test_mypy_cache_dir_separates_projects_and_repositories(tmp_path: Path) -> None:
     subject = cache(tmp_path)
     with ExitStack() as stack:
-        root = subject.mypy_cache_dir(revision(working_copy=True), stack)
-        backend = subject.mypy_cache_dir(revision(working_copy=True), stack, "backend")
-        frontend = subject.mypy_cache_dir(revision(working_copy=True), stack, "frontend")
+        root = subject.mypy_cache_dir("target", stack, HERE)
+        backend = subject.mypy_cache_dir("target", stack, location(Path("/work/repo"), "backend"))
+        other = subject.mypy_cache_dir("target", stack, location(Path("/work/other"), "."))
 
-    assert len({root, backend, frontend}) == 3
-    assert backend.name.endswith("-wc")
+    assert len({root, backend, other}) == 3
 
 
-def test_mypy_cache_dir_is_stable_across_calls(tmp_path: Path) -> None:
+def test_mypy_cache_dir_is_kept_across_commits(tmp_path: Path) -> None:
+    """Keyed by commit, every commit or push meant a cold, full mypy run."""
     subject = cache(tmp_path)
     with ExitStack() as stack:
-        assert subject.mypy_cache_dir(revision(), stack) == subject.mypy_cache_dir(
-            revision(), stack
+        assert subject.mypy_cache_dir("base", stack, HERE) == subject.mypy_cache_dir(
+            "base", stack, HERE
         )
+
+
+def test_seed_starts_a_new_side_from_the_other(tmp_path: Path) -> None:
+    subject = cache(tmp_path)
+    with ExitStack() as stack:
+        target = subject.mypy_cache_dir("target", stack, HERE)
+    (target / "cache.0.db").write_bytes(b"warm")
+
+    subject.seed(HERE)
+
+    with ExitStack() as stack:
+        base = subject.mypy_cache_dir("base", stack, HERE)
+    assert (base / "cache.0.db").read_bytes() == b"warm"
+
+
+def test_seed_never_overwrites_an_existing_side(tmp_path: Path) -> None:
+    subject = cache(tmp_path)
+    with ExitStack() as stack:
+        target = subject.mypy_cache_dir("target", stack, HERE)
+        base = subject.mypy_cache_dir("base", stack, HERE)
+    (target / "cache.0.db").write_bytes(b"target")
+    (base / "cache.0.db").write_bytes(b"base")
+
+    subject.seed(HERE)
+
+    assert (base / "cache.0.db").read_bytes() == b"base"
 
 
 # ------------------------------------------------------------------ retention
@@ -193,8 +219,10 @@ def _seed_mypy_dirs(subject: ResultCache, count: int) -> list[Path]:
     return made
 
 
-def test_prune_keeps_two_entries_per_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """One run touches at most a base and a target, so `keep` runs == 2*keep entries."""
+def test_prune_keeps_the_projects_of_the_last_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each project directory holds its base and target caches: `keep` runs == `keep` dirs."""
     monkeypatch.setenv(KEEP_ENV_VAR, "3")
     subject = cache(tmp_path)
     made = _seed_mypy_dirs(subject, 10)
@@ -202,7 +230,7 @@ def test_prune_keeps_two_entries_per_run(tmp_path: Path, monkeypatch: pytest.Mon
     subject.prune()
 
     survivors = sorted(p.name for p in (subject.directory / "mypy-cache").iterdir())
-    assert survivors == ["rev04", "rev05", "rev06", "rev07", "rev08", "rev09"]
+    assert survivors == ["rev07", "rev08", "rev09"]
     assert not made[0].exists()
 
 
@@ -215,10 +243,7 @@ def test_prune_respects_the_environment_variable(
 
     subject.prune()
 
-    assert sorted(p.name for p in (subject.directory / "mypy-cache").iterdir()) == [
-        "rev04",
-        "rev05",
-    ]
+    assert sorted(p.name for p in (subject.directory / "mypy-cache").iterdir()) == ["rev05"]
 
 
 def test_prune_disabled_by_non_positive_keep(

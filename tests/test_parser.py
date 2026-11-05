@@ -48,7 +48,7 @@ def test_parses_a_basic_error() -> None:
 def test_formats_back_into_mypy_style() -> None:
     messages, _ = parse_json_output(line(), WORKDIR)
     assert messages[0].format() == (
-        'src/app.py:42:11: error: Incompatible return value type (got "str", expected "int")'
+        'src/app.py:42:12: error: Incompatible return value type (got "str", expected "int")'
         "  [return-value]"
     )
 
@@ -77,10 +77,31 @@ def test_notes_attach_to_the_preceding_error() -> None:
     assert messages[0].notes == ("Possible overload variant:", "  def f(x: int) -> int")
 
 
-def test_leading_note_without_an_error_is_kept_as_its_own_message() -> None:
+def test_a_note_with_nothing_to_elaborate_on_is_kept_as_its_own_message() -> None:
+    """A run with nothing but a reveal_type() exits 1 with one note; it must not vanish."""
     messages, _ = parse_json_output(line(severity="note", message="standalone"), WORKDIR)
     assert len(messages) == 1
     assert messages[0].severity is Severity.NOTE
+
+
+def test_a_note_elsewhere_is_not_attached_to_the_previous_error() -> None:
+    """`In function "f":` context lines (line -1) and reveal_type() notes come after unrelated
+    errors, even in other files; they used to be printed as part of them."""
+    stream = "\n".join(
+        [
+            line(),
+            line(severity="note", message='In function "h":', line=-1, column=-1, code=None),
+            line(file="src/other.py", severity="note", message="Revealed type", code=None),
+        ]
+    )
+    messages, _ = parse_json_output(stream, WORKDIR)
+    assert messages[0].notes == ()
+    assert [m.severity for m in messages] == [Severity.ERROR, Severity.NOTE, Severity.NOTE]
+
+
+def test_the_hint_is_part_of_the_note_lines() -> None:
+    messages, _ = parse_json_output(line(hint="Hint: install types-x\nSee the docs"), WORKDIR)
+    assert messages[0].note_lines() == ["Hint: install types-x", "See the docs"]
 
 
 def test_non_json_noise_is_counted_not_fatal() -> None:

@@ -68,12 +68,20 @@ class MypyMessage:
         return (self.path, self.line, self.column, self.code or "", self.message)
 
     def format(self) -> str:
-        """Render exactly the way mypy itself would, so output stays greppable."""
+        """Render exactly the way mypy itself would, so output stays greppable and clickable.
+
+        mypy's JSON column is 0-based; its text output, and every editor, count from 1.
+        """
         position = f"{self.path}:{self.line}"
-        if self.column is not None:
-            position += f":{self.column}"
+        if self.column is not None and self.column >= 0:
+            position += f":{self.column + 1}"
         suffix = f"  [{self.code}]" if self.code else ""
         return f"{position}: {self.severity.value}: {self.message}{suffix}"
+
+    def note_lines(self) -> list[str]:
+        """mypy's notes for this diagnostic: its hint (same location), then attached notes."""
+        hint = [line for line in self.hint.splitlines() if line.strip()]
+        return [*hint, *self.notes]
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -112,6 +120,8 @@ class DiffResult:
     changed: tuple[tuple[MypyMessage, MypyMessage], ...] = ()
     #: Set when the comparison could not be done in full; says why. The lists are then partial.
     incomplete: str = ""
+    #: How the base was chosen, for display: "fork point with main", "latest pushed ancestor".
+    base_reason: str = ""
     #: Matching statistics: "moved" (unchanged errors that matched at another position),
     #: "moved_between_files" (the subset that moved to another file).
     stats: dict[str, int] = field(default_factory=dict)

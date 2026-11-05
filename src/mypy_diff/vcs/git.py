@@ -37,6 +37,8 @@ class GitBackend:
         self.notes: list[str] = []
         #: Shown always: something about the comparison the user should know.
         self.warnings: list[str] = []
+        #: How the last base was chosen, for the report header.
+        self.base_reason = ""
 
     # ---------------------------------------------------------------- basics
 
@@ -140,10 +142,16 @@ class GitBackend:
             if len(pushed) == 1:
                 base = self._describe(pushed[0])
                 if base is not None:
+                    self.base_reason = (
+                        "everything is pushed: uncommitted changes only"
+                        if base.commit_id == tip
+                        else "latest pushed ancestor"
+                    )
                     return base
             elif len(pushed) > 1:
                 merged = self._virtual_merge(pushed)
                 if merged is not None:
+                    self.base_reason = "merge of the pushed commits your work builds on"
                     return merged
                 self.warnings.append(
                     "Your unpushed work builds on several pushed commits ("
@@ -158,10 +166,12 @@ class GitBackend:
             if merge_base and (target.is_working_copy or merge_base != tip):
                 info = self._describe(merge_base)
                 if info is not None:
+                    self.base_reason = f"fork point with {revspec}"
                     return info
 
         parent = self._describe(f"{tip}~1")
         if parent is not None:
+            self.base_reason = "parent commit"
             return parent
         raise MypyDiffError(
             "Could not determine a base revision automatically.",
@@ -224,6 +234,19 @@ class GitBackend:
             return None
         return self._describe(completed.stdout.strip())
 
+    def is_shallow(self) -> bool:
+        """Whether this is a shallow clone, which may lack the fork point."""
+        return self._git.try_out("rev-parse", "--is-shallow-repository") == "true"
+
+    def has_uncommitted_changes(self) -> bool:
+        """Whether the working copy differs from HEAD: edits, staged or not, or new files."""
+        status = self._git.try_out("status", "--porcelain", "--untracked-files=normal")
+        return status is None or bool(status)
+
+    def remote_branch(self, name: str) -> str:
+        """How to name the remote-tracking copy of a branch, e.g. the CI's target branch."""
+        return f"origin/{name}"
+
     def _has_remote_refs(self) -> bool:
         return bool(self._git.try_out("for-each-ref", "--format=%(refname)", "refs/remotes/"))
 
@@ -248,8 +271,10 @@ class GitBackend:
         """
         rev = self.resolve(revspec)
         if tip:
+            self.base_reason = f"tip of {revspec}"
             return rev
         best = self.fork_point(rev, target)
+        self.base_reason = f"fork point with {revspec}"
         if not self._names_a_branch(revspec, rev):
             # A tag or a commit id means exactly that revision.
             return best
@@ -270,6 +295,7 @@ class GitBackend:
         if better_spelling is not None:
             shown = self._git.try_out("rev-parse", "--abbrev-ref", better_spelling)
             shown = shown or better_spelling.removeprefix("refs/heads/")
+            self.base_reason = f"fork point with {shown}"
             self.warnings.append(
                 f"`{revspec}` ({rev.short_id}) is behind `{shown}`: using the fork point with "
                 f"`{shown}` ({best.short_id}), so commits already there do not show up as "

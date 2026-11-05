@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from mypy_diff import MypyDiffError
-from mypy_diff.project import Project, find_project
+from mypy_diff.project import Project, configured_targets, find_project, mypy_config_file
 
 
 @pytest.fixture
@@ -96,3 +96,33 @@ class TestRepoPath:
         checkout = tmp_path / "checkout"
         assert Project(root, "backend").directory_in(checkout) == checkout / "backend"
         assert Project(root).directory_in(checkout) == checkout
+
+
+# ------------------------------------------------------------------ the config mypy will read
+
+
+def test_mypy_config_file_is_found_walking_up(tmp_path: Path) -> None:
+    (tmp_path / "pyproject.toml").write_text('[tool.mypy]\nfiles = ["src"]\n', encoding="utf-8")
+    nested = tmp_path / "src" / "pkg"
+    nested.mkdir(parents=True)
+    assert mypy_config_file(nested, tmp_path) == tmp_path / "pyproject.toml"
+
+
+def test_a_pyproject_without_tool_mypy_is_not_a_config(tmp_path: Path) -> None:
+    (tmp_path / "pyproject.toml").write_text("[project]\nname = 'x'\n", encoding="utf-8")
+    assert mypy_config_file(tmp_path, tmp_path) is None
+
+
+def test_mypy_ini_wins_over_pyproject(tmp_path: Path) -> None:
+    (tmp_path / "pyproject.toml").write_text("[tool.mypy]\n", encoding="utf-8")
+    (tmp_path / "mypy.ini").write_text("[mypy]\n", encoding="utf-8")
+    assert mypy_config_file(tmp_path, tmp_path) == tmp_path / "mypy.ini"
+
+
+def test_configured_targets_from_pyproject_and_ini(tmp_path: Path) -> None:
+    pyproject = tmp_path / "pyproject.toml"
+    pyproject.write_text('[tool.mypy]\nfiles = ["src", "tests"]\npackages = "a, b"\n', "utf-8")
+    assert configured_targets(pyproject) == ["src", "tests", "a", "b"]
+    ini = tmp_path / "mypy.ini"
+    ini.write_text("[mypy]\nfiles = src, scripts\n", encoding="utf-8")
+    assert configured_targets(ini) == ["src", "scripts"]

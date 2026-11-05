@@ -71,6 +71,40 @@ def test_doctor_reports_the_tools(repo: Repo) -> None:
     assert "repository root" in result.output
 
 
+def test_doctor_shows_what_a_run_would_use(repo: Repo, short_tmp_path: Path) -> None:
+    """The config mypy reads, what it would check, the base and why, and the cache."""
+    result = invoke(repo, "--doctor", "-b", "main", cache=short_tmp_path / "cache")
+    assert "mypy config      pyproject.toml" in result.stdout
+    # The fixture's config names no files: exactly the "no files to check" trap.
+    assert "none configured: pass them after `--`" in result.stdout
+    assert "(fork point with main)" in result.stdout
+    assert str(short_tmp_path / "cache") in result.stdout
+
+
+def test_doctor_warns_about_a_foreign_virtualenv(
+    repo: Repo, short_tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An activated virtualenv wins over the project's own .venv; say so when they differ."""
+    own = repo.root / ".venv" / ("Scripts" if sys.platform == "win32" else "bin")
+    own.mkdir(parents=True)
+    other = short_tmp_path / "other-venv"
+    binaries = other / ("Scripts" if sys.platform == "win32" else "bin")
+    binaries.mkdir(parents=True)
+    mypy = binaries / ("mypy.exe" if sys.platform == "win32" else "mypy")
+    if sys.platform == "win32":
+        pytest.skip("needs an executable script")
+    mypy.write_text(f'#!/bin/sh\nexec {sys.executable} -m mypy "$@"\n', encoding="utf-8")
+    mypy.chmod(0o755)
+    monkeypatch.setenv("VIRTUAL_ENV", str(other))
+    monkeypatch.delenv("MYPY_DIFF_MYPY", raising=False)
+
+    app = build_app(JjBackend if repo.vcs == "jj" else GitBackend)
+    result = runner.invoke(app, ["--doctor"], catch_exceptions=False)
+
+    assert "mypy found via   active virtualenv" in result.stdout
+    assert "not from the project's own" in result.stdout
+
+
 def test_clean_working_copy_reports_no_change(repo: Repo) -> None:
     result = invoke(repo, "--", "src")
     assert result.exit_code == EXIT_OK
@@ -207,6 +241,73 @@ def test_json_format_is_parseable(repo: Repo) -> None:
     assert payload["summary"]["new"] == 1
     assert payload["new"][0]["path"] == "src/clean.py"
     assert payload["new"][0]["code"] == "return-value"
+
+
+def test_verbose_output_stays_off_stdout(repo: Repo) -> None:
+    """`--format json -v` used to put the header and `$ git ...` lines into the JSON."""
+    repo.write("src/clean.py", BROKEN_SOURCE)
+    result = invoke(repo, "-v", "--format", "json", "--", "src")
+    assert json.loads(result.stdout)["summary"]["new"] == 1
+    assert "base " in result.stderr
+
+
+def test_forced_colours_never_reach_machine_output(
+    repo: Repo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CI often exports FORCE_COLOR; it used to put escape codes into JSON and plain output."""
+    monkeypatch.setenv("FORCE_COLOR", "1")
+    monkeypatch.setenv("TTY_COMPATIBLE", "1")
+    repo.write("src/clean.py", BROKEN_SOURCE)
+    assert json.loads(invoke(repo, "--format", "json", "--", "src").stdout)["summary"]["new"] == 1
+    assert "\x1b" not in invoke(repo, "--format", "plain", "--", "src").stdout
+
+
+def test_columns_are_one_based_like_mypy_prints_them(repo: Repo) -> None:
+    repo.write("src/clean.py", BROKEN_SOURCE)
+    # `    return 42`: mypy reports column 12, counting from 1.
+    assert "src/clean.py:6:12: error:" in invoke(repo, "--", "src").output
+
+
+def test_the_header_says_how_the_base_was_chosen(repo: Repo) -> None:
+    header = invoke(repo, "-b", "main", "--", "src").stdout.splitlines()[0]
+    assert "(fork point with main)" in header
+
+
+def test_github_format_writes_the_job_summary_and_a_verdict(
+    repo: Repo, short_tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    summary = short_tmp_path / "summary.md"
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+    repo.write("src/clean.py", BROKEN_SOURCE)
+
+    result = invoke(repo, "--format", "github", "--", "src")
+
+    text = summary.read_text(encoding="utf-8")
+    assert "## mypy-diff" in text
+    assert "src/clean.py:6:12" in text
+    assert "Found 1 new" in result.stderr
+    assert result.stdout.startswith("::error file=src/clean.py,line=6")
+
+
+@pytest.mark.skipif(GIT is None, reason="git is not installed")
+def test_a_pull_request_job_compares_against_its_target_branch(
+    git_repo: Repo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """In CI everything is pushed, so the default base used to be HEAD itself: "No change"."""
+    assert GIT is not None
+    monkeypatch.chdir(git_repo.root)
+    run([GIT, "checkout", "-q", "-b", "feature"], cwd=git_repo.root)
+    git_repo.write("src/clean.py", BROKEN_SOURCE)
+    run([GIT, "commit", "-qam", "feature adds an error"], cwd=git_repo.root)
+    run([GIT, "push", "-q", "-u", "origin", "feature"], cwd=git_repo.root)
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setenv("GITHUB_BASE_REF", "main")
+
+    result = invoke(git_repo, "--", "src")
+
+    assert result.exit_code == EXIT_NEW_ERRORS, result.output
+    assert "+ NEW (1)" in result.output
+    assert "GITHUB_BASE_REF" in result.output.splitlines()[0]
 
 
 def test_github_format_emits_annotations(repo: Repo) -> None:
@@ -371,13 +472,38 @@ def test_no_cache_leaves_nothing_behind(repo: Repo, isolated_cache: Path) -> Non
 
 
 def test_a_normal_run_keeps_mypy_caches_apart(repo: Repo, short_tmp_path: Path) -> None:
-    """Base and working copy must not share one incremental cache directory."""
+    """Base and working copy must not share one incremental cache directory; across runs each
+    side keeps its own, whatever commit it checks."""
     cache = short_tmp_path / "cache"
+    repo.write("src/clean.py", BROKEN_SOURCE)
     invoke(repo, "--", "src", cache=cache)
 
-    directories = sorted(p.name for p in (cache / "mypy-cache").iterdir())
-    assert len(directories) == 2, directories
-    assert any(name.endswith("-wc") for name in directories)
+    projects = list((cache / "mypy-cache").iterdir())
+    assert len(projects) == 1, projects
+    assert sorted(p.name for p in projects[0].iterdir()) == ["base", "target"]
+
+
+def test_an_unchanged_working_copy_is_checked_once(repo: Repo) -> None:
+    """Base and target are the same tree: one mypy run, and a word that nothing is compared.
+
+    In CI with everything pushed, the default base is HEAD itself, which used to cost two full
+    runs and say nothing but "No change".
+    """
+    result = invoke(repo, "-v", "--", "src")
+    assert result.exit_code == EXIT_OK, result.output
+    assert "the base is the target itself" in result.stderr
+    assert "checked out" not in result.stderr
+    assert "1 unchanged error" in result.stdout
+
+
+@pytest.mark.parametrize("flag", ["--parallel", "--no-parallel"])
+def test_parallel_and_sequential_runs_agree(repo: Repo, flag: str) -> None:
+    repo.write("src/clean.py", BROKEN_SOURCE)
+    repo.write("src/legacy.py", "# padding\n" + repo.read("src/legacy.py"))
+    result = invoke(repo, flag, "--", "src")
+    assert result.exit_code == EXIT_NEW_ERRORS, result.output
+    assert "+ NEW (1)" in result.stdout
+    assert "1 unchanged error" in result.stdout
 
 
 def test_retention_caps_the_incremental_cache(
@@ -660,6 +786,7 @@ def test_an_environment_change_misses_the_cache(
     another: after installing stubs, pre-existing errors used to come out NEW."""
     cache = short_tmp_path / "cache"
     monkeypatch.delenv("MYPYPATH", raising=False)
+    repo.write("src/extra.py", "extra: int = 1\n")  # a change, so the base is checked too
     invoke(repo, "--", "src", cache=cache)
     assert "cache hit" in invoke(repo, "-v", "--", "src", cache=cache).output
 
@@ -840,6 +967,7 @@ def test_an_outside_config_file_is_part_of_the_cache_key(repo: Repo, short_tmp_p
     config = short_tmp_path / "shared.ini"
     config.write_text("[mypy]\npython_version = 3.12\n", encoding="utf-8")
     arguments = ("--", "--config-file", str(config), "src")
+    repo.write("src/extra.py", "extra: int = 1\n")  # a change, so the base is checked too
     invoke(repo, *arguments, cache=cache)
     assert "cache hit" in invoke(repo, "-v", *arguments, cache=cache).output
 
@@ -865,6 +993,7 @@ def test_a_generated_module_the_base_lacks_is_pointed_out(
     git_repo.write("src/app.py", 'import gen_pb2\n\nlabel = "v" + gen_pb2.VERSION\n')
     commit_as_main(git_repo, "uses generated code")
     git_repo.write("src/gen_pb2.py", "VERSION: int = 1\n")
+    git_repo.write("src/extra.py", "extra: int = 1\n")  # some work, so the base is checked
 
     result = invoke(git_repo, "-b", "main", "--", "src")
 

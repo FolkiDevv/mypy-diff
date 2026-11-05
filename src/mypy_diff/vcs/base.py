@@ -98,6 +98,8 @@ class VcsBackend(Protocol):
     notes: list[str]
     #: Things the user must know about the comparison, shown on every run.
     warnings: list[str]
+    #: How the last base was chosen ("latest pushed ancestor", "fork point with main").
+    base_reason: str
 
     def root(self) -> Path:
         """Absolute path to the repository/workspace root."""
@@ -121,6 +123,18 @@ class VcsBackend(Protocol):
 
     def fork_point(self, rev: RevisionInfo, target: RevisionInfo | None = None) -> RevisionInfo:
         """The common ancestor of ``rev`` and ``target`` (default: the working copy)."""
+        ...
+
+    def remote_branch(self, name: str) -> str:
+        """A revision spelling for the remote copy of branch ``name``."""
+        ...
+
+    def has_uncommitted_changes(self) -> bool:
+        """Whether the working copy on disk differs from its commit (``working_copy()``)."""
+        ...
+
+    def is_shallow(self) -> bool:
+        """Whether the repository is a shallow clone."""
         ...
 
     def working_copy(self) -> RevisionInfo:
