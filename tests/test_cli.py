@@ -16,7 +16,7 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner, Result
 
-from mypy_diff.cli import EXIT_FAILURE, EXIT_NEW_ERRORS, EXIT_OK, build_app
+from mypy_diff.cli import EXIT_FAILURE, EXIT_NEW_ERRORS, EXIT_OK, build_app, detect_backend, main
 from mypy_diff.vcs import GitBackend, JjBackend
 
 from .conftest import GIT, JJ, SUBPROJECT, Repo, run
@@ -1028,6 +1028,145 @@ def test_help_mentions_the_right_vcs(factory: Callable[..., object]) -> None:
     result = runner.invoke(build_app(factory), ["--help"])  # type: ignore[arg-type]
     assert result.exit_code == EXIT_OK
     assert factory.name in result.output  # type: ignore[attr-defined]
+
+
+def test_help_shows_examples_and_exit_codes() -> None:
+    result = runner.invoke(build_app(GitBackend, prog="mypy-diff"), ["--help"])
+    assert result.exit_code == EXIT_OK
+    assert "mypy-diff -b main --tip" in result.output
+    assert "Exit codes:" in result.output
+    assert "2  mypy-diff itself failed" in result.output
+
+
+def test_tip_without_a_branch_is_an_error(repo: Repo) -> None:
+    """It used to be ignored: the run compared with the fork point and said nothing."""
+    result = invoke(repo, "--tip", "--", "src")
+    assert result.exit_code == EXIT_FAILURE
+    assert "--tip needs a branch" in result.stderr
+
+
+# ------------------------------------------------------------------ [tool.mypy-diff]
+
+
+def configure(repo: Repo, table: str) -> None:
+    """Add a [tool.mypy-diff] table to the fixture's pyproject.toml in the working copy."""
+    repo.write("pyproject.toml", repo.read("pyproject.toml") + "\n[tool.mypy-diff]\n" + table)
+
+
+def test_the_config_supplies_the_base_and_the_targets(repo: Repo) -> None:
+    configure(repo, 'base = "main"\nargs = ["src"]\n')
+    repo.write("src/clean.py", BROKEN_SOURCE)
+
+    result = invoke(repo)  # no `--`: the targets come from the config
+
+    assert result.exit_code == EXIT_NEW_ERRORS, result.output
+    assert "+ NEW (1)" in result.stdout
+    assert "fork point with main, from [tool.mypy-diff]" in result.stdout.splitlines()[0]
+
+
+def test_the_command_line_beats_the_config(repo: Repo) -> None:
+    configure(repo, 'format = "json"\nonly = "new"\n')
+    repo.write("src/legacy.py", "def broken() -> str:\n    return 'now correct'\n")
+
+    from_config = invoke(repo, "--", "src")
+    assert json.loads(from_config.stdout)["only"] == "new"
+
+    overridden = invoke(repo, "--format", "plain", "--", "src")
+    assert not overridden.stdout.lstrip().startswith("{")
+    # What the command line leaves alone still comes from the file.
+    assert "FIXED" not in overridden.stdout
+
+
+def test_a_paired_flag_turns_a_configured_option_off(repo: Repo) -> None:
+    configure(repo, "fail-on-changed = true\n")
+    repo.write("src/legacy.py", 'def broken() -> float:\n    return "already wrong"\n')
+
+    assert invoke(repo, "--", "src").exit_code == EXIT_NEW_ERRORS
+    assert invoke(repo, "--no-fail-on-changed", "--", "src").exit_code == EXIT_OK
+
+
+def test_a_config_mistake_fails_the_run(repo: Repo) -> None:
+    configure(repo, 'bse = "main"\n')
+    result = invoke(repo, "--", "src")
+    assert result.exit_code == EXIT_FAILURE
+    assert "unknown key 'bse'" in result.stderr
+
+
+def test_the_config_mypy_command_is_used(repo: Repo, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("MYPY_DIFF_MYPY", raising=False)
+    configure(repo, f"mypy-cmd = '\"{sys.executable}\" -m mypy'\n")
+
+    app = build_app(JjBackend if repo.vcs == "jj" else GitBackend)
+    result = runner.invoke(app, ["--doctor"], catch_exceptions=False)
+
+    assert "mypy found via   mypy-cmd in [tool.mypy-diff]" in result.stdout
+    assert "settings         pyproject.toml  [tool.mypy-diff]" in result.stdout
+
+
+def test_on_a_pull_request_its_target_beats_the_configured_base(
+    git_repo: Repo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A PR into a release branch must not be compared with the configured main."""
+    monkeypatch.chdir(git_repo.root)
+    configure(git_repo, 'base = "no-such-branch"\n')
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setenv("GITHUB_BASE_REF", "main")
+
+    result = invoke(git_repo, "--", "src")
+
+    assert result.exit_code == EXIT_OK, result.output
+    assert "GITHUB_BASE_REF" in result.stdout.splitlines()[0]
+
+
+# ------------------------------------------------------------------ mypy-diff
+
+
+@pytest.mark.parametrize(
+    ("markers", "jj_installed", "expected"),
+    [
+        ([".git"], True, GitBackend),
+        ([".jj", ".git"], True, JjBackend),
+        ([".jj", ".git"], False, GitBackend),
+        ([".jj"], False, JjBackend),
+        ([], True, GitBackend),
+    ],
+)
+def test_mypy_diff_picks_the_backend_of_the_repository(
+    short_tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    markers: list[str],
+    jj_installed: bool,
+    expected: type[object],
+) -> None:
+    for marker in markers:
+        (short_tmp_path / marker).mkdir()
+    nested = short_tmp_path / "src" / "pkg"
+    nested.mkdir(parents=True)
+    monkeypatch.setattr(shutil, "which", lambda name: f"/bin/{name}" if jj_installed else None)
+
+    assert detect_backend(nested) is expected
+
+
+def test_the_nearest_repository_wins(short_tmp_path: Path) -> None:
+    """A git repository checked out inside a jj workspace is a git repository."""
+    (short_tmp_path / ".jj").mkdir()
+    inner = short_tmp_path / "vendor" / "lib"
+    (inner / ".git").mkdir(parents=True)
+
+    assert detect_backend(inner) is GitBackend
+
+
+def test_mypy_diff_runs_with_the_detected_backend(
+    git_repo: Repo, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(git_repo.root)
+    monkeypatch.setattr(sys, "argv", ["mypy-diff", "--mypy-cmd", MYPY_CMD, "--doctor"])
+
+    with pytest.raises(SystemExit) as exited:
+        main()
+
+    assert exited.value.code == EXIT_OK
+    assert "git" in capsys.readouterr().out
 
 
 def test_skip_version_check_still_requires_the_tool_to_exist(

@@ -26,12 +26,17 @@ mypy-diff  base: zqxlrpvw  a1b2c3d4  main@origin  "feat: add parser"
 Found 2 new, 1 fixed, 147 unchanged  (net +1)
 ```
 
-Two commands, same behaviour, different version control:
+One program, for either version control system:
 
 | Command | For |
 |---|---|
+| `mypy-diff` | whichever of the two manages the current directory |
 | `mypy-diff-jj` | [Jujutsu](https://jj-vcs.github.io/jj/) workspaces (jj on its git backend) |
 | `mypy-diff-git` | plain git repositories |
+
+`mypy-diff` looks for the nearest `.jj` or `.git` above the current directory. A colocated
+repository has both and gets jj — unless jj is not installed, in which case git reads the same
+commits. The two named commands are for scripts that should not guess.
 
 ## Install
 
@@ -77,21 +82,25 @@ mypy instead — see [Which mypy gets run](#which-mypy-gets-run).
 Check your setup at any time:
 
 ```bash
-mypy-diff-jj --doctor
+mypy-diff --doctor
 ```
 
 It prints the tools it found and everything a run would use, without running mypy: the mypy
-config it would read and the targets that config names (or that it names none), the base it would
-compare against and why, whether the clone is shallow, and the cache directory with its size. It
-warns when an activated virtualenv overrides the project's own `.venv`.
+config it would read and the targets that config names (or that it names none), the
+`[tool.mypy-diff]` settings in effect, the base it would compare against and why, whether the
+clone is shallow, and the cache directory with its size. It warns when an activated virtualenv
+overrides the project's own `.venv`.
 
 ## Usage
 
 ```bash
-mypy-diff-jj                      # default base, check whatever the mypy config lists
-mypy-diff-jj -- src tests         # everything after `--` goes to mypy, for both revisions
-mypy-diff-git -b main -- src      # compare against where you branched off main
+mypy-diff                      # default base, check whatever the mypy config lists
+mypy-diff -- src tests         # everything after `--` goes to mypy, for both revisions
+mypy-diff -b main -- src       # compare against where you branched off main
+mypy-diff -b main --tip        # compare against main as it is now
 ```
+
+`mypy-diff --help` lists these examples, every option and the exit codes.
 
 ### What gets checked
 
@@ -149,7 +158,8 @@ That is almost always the point you branched from, so the diff shows exactly you
 `-b NAME` compares against the **fork point** — the common ancestor of `NAME` and the target.
 This is what you want: if `main` moved ahead after you branched, unrelated fixes that landed on
 `main` would otherwise show up as "new errors" in your diff. Pass `--tip` for the literal branch
-head.
+head. `--tip` needs a branch to take the tip of — from `-b`, `base` in the config, or the pull
+request — and is an error without one, rather than being silently ignored.
 
 With `mypy-diff-git`, a bare branch name also stands for its upstream and for `origin/NAME` /
 `upstream/NAME`. If your local `main` is behind one of them — you branched from `origin/main` and
@@ -181,10 +191,11 @@ the run fails.
 ```
   -b, --base REV         Base revision. Default: latest pushed named ancestor.
       --to REV           Target revision. Default: the working copy on disk.
-      --tip              With -b NAME, use the branch tip instead of the fork point.
+      --tip              Use the tip of the -b branch instead of the fork point.
       --format FMT       pretty | plain | json | github            [pretty]
       --only WHAT        new | fixed | all                         [all]
-      --show-unchanged   List unchanged errors instead of counting them.
+      --show-unchanged / --no-show-unchanged
+                         List unchanged errors instead of counting them.
       --project DIR      Directory to run mypy in. Default: nearest mypy config above you.
       --mypy-cmd TEXT    Command used to run mypy, e.g. 'uv run mypy'.
       --cache-dir PATH   Where to keep cached results.
@@ -192,7 +203,8 @@ the run fails.
       --clean-cache      Delete the whole mypy-diff cache, then exit.
       --no-progress      Do not show the progress indicator.
       --exit-zero        Always exit 0, even when new errors appear.
-      --fail-on-changed  Also exit 1 when a pre-existing error changed its message.
+      --fail-on-changed / --no-fail-on-changed
+                         Also exit 1 when a pre-existing error changed its message.
       --parallel / --no-parallel
                          Run mypy on base and working copy at once. Default: with 4+ CPUs.
       --skip-version-check
@@ -202,6 +214,35 @@ the run fails.
 ```
 
 **Exit codes:** `0` no new errors · `1` new errors found · `2` mypy-diff itself failed.
+
+### Project defaults: `[tool.mypy-diff]`
+
+What a team passes on every run belongs in `pyproject.toml`:
+
+```toml
+[tool.mypy-diff]
+base = "origin/main"          # default for -b
+args = ["src", "tests"]       # mypy arguments when none are given after `--`
+mypy-cmd = "uv run mypy"      # default for --mypy-cmd
+format = "pretty"             # pretty | plain | json | github
+only = "all"                  # all | new | fixed
+show-unchanged = false
+fail-on-changed = false
+parallel = true               # unset: with 4+ CPUs
+```
+
+Keys are spelt like the long options. The table is looked for in the project directory and in
+every directory above it up to the repository root; the nearest `pyproject.toml` that has one
+wins, so a monorepo can keep one table at the root or one per project. The working copy's file is
+used, for both revisions.
+
+The command line always beats the file, and every on/off option has a `--no-` form to turn off
+what the file turns on. Two things beat the file as well: `$MYPY_DIFF_MYPY` beats `mypy-cmd` (one
+machine overriding the team's choice), and in a pull-request job the branch the pull request
+merges into beats `base` — a pull request into a release branch is never compared with main.
+
+An unknown key or a value of the wrong type stops the run with exit code `2`: a misspelt `bse`
+that was quietly ignored would leave CI comparing against the wrong base.
 
 `2` also covers every run whose result cannot be trusted: mypy killed by a signal (out of
 memory), mypy exiting 1 without printing a single diagnostic (a wrapper such as `poetry run`
@@ -233,14 +274,15 @@ and under `--no-progress`.
   with:
     fetch-depth: 0   # the fork point must be in the history
 - run: uv tool install mypy-diff
-- run: mypy-diff-git --format github -- src
+- run: mypy-diff --format github -- src
 ```
 
 The job fails only when the branch *adds* type errors; the pre-existing backlog is ignored.
 
 - In a pull-request job (`GITHUB_BASE_REF` is set), the default base is the fork point with the
-  branch the pull request merges into. Outside CI the default is the latest pushed ancestor —
-  which in CI, where everything is pushed, would be the commit itself. `-b` still wins.
+  branch the pull request merges into (with `--tip`, its tip), even over `base` in the config.
+  Outside CI the default is the latest pushed ancestor — which in CI, where everything is pushed,
+  would be the commit itself. `-b` still wins.
 - `--format github` turns each new error into an inline annotation, and each changed one into a
   notice on its line. A fixed error's line number belongs to the base revision, so it becomes a
   notice on the file only.
@@ -312,16 +354,17 @@ First match wins, and `--doctor` tells you which one was used:
 
 1. `--mypy-cmd 'uv run mypy'`
 2. `$MYPY_DIFF_MYPY`
+3. `mypy-cmd` in `[tool.mypy-diff]`
 
-   Both are pinned to the working copy, because the base runs in a temporary checkout: a relative
+   All three are pinned to the working copy, because the base runs in a temporary checkout: a relative
    path such as `.venv/bin/mypy` is made absolute, and `uv run` gets `--project <project>` so that
    it does not build a fresh environment from the base revision's lock file.
-3. the active virtualenv (`$VIRTUAL_ENV`)
-4. the project's `.venv`
-5. `uv run --project <project> mypy` (for a uv workspace member, uv uses the workspace's
+4. the active virtualenv (`$VIRTUAL_ENV`)
+5. the project's `.venv`
+6. `uv run --project <project> mypy` (for a uv workspace member, uv uses the workspace's
    environment)
-6. the repository root's `.venv`, when the project is in a subdirectory and uv is not available
-7. `mypy` on `PATH`
+7. the repository root's `.venv`, when the project is in a subdirectory and uv is not available
+8. `mypy` on `PATH`
 
 Both revisions are always checked with the same mypy and the same arguments, and each revision
 gets its own incremental mypy cache — so the two runs never invalidate each other, and your own
@@ -386,7 +429,7 @@ MYPY_DIFF_CACHE_KEEP=0    # keep everything, never evict
 ### Clearing it
 
 ```bash
-mypy-diff-jj --clean-cache
+mypy-diff --clean-cache
 ```
 
 Prints how much was freed and exits. It works from anywhere — no repository needed — and honours

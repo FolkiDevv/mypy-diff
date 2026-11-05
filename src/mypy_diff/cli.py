@@ -1,7 +1,8 @@
 """Command line interface.
 
-Both commands are the same program over a different backend, so everything lives in one
-factory and the two entry points only pick a backend.
+All three commands are the same program over a different backend, so everything lives in one
+factory: `mypy-diff-jj` and `mypy-diff-git` pick their backend, `mypy-diff` the one of the
+repository it is run in.
 """
 
 # NOTE: no `from __future__ import annotations` here. Typer resolves the Annotated[...]
@@ -13,6 +14,7 @@ import functools
 import hashlib
 import os
 import re
+import shutil
 import sys
 import traceback
 from collections.abc import Iterable
@@ -28,6 +30,7 @@ from rich.text import Text
 from . import MypyDiffError, __version__
 from .cache import ResultCache
 from .cache import location as cache_location
+from .config import Settings, load_settings
 from .matching import diff_messages
 from .models import DiffResult, MypyMessage, RevisionInfo
 from .mypy_exec import (
@@ -57,26 +60,33 @@ EXIT_FAILURE = 2
 _TOTAL_STEPS = 5
 
 
-def build_app(backend_type: type[GitBackend] | type[JjBackend]) -> typer.Typer:
-    """Build the CLI for one backend. The only differences are help texts and preflight."""
+def build_app(
+    backend_type: type[GitBackend] | type[JjBackend], prog: str | None = None
+) -> typer.Typer:
+    """Build the CLI for one backend. The only differences are help texts and preflight.
+
+    ``prog`` is the command name used in messages and examples; by default the backend's own
+    command, ``mypy-diff-<name>``.
+    """
+    prog = prog or f"mypy-diff-{backend_type.name}"
     app = typer.Typer(
         add_completion=False,
         rich_markup_mode=None,
         help=(
             f"Diff mypy results between two revisions using {backend_type.name}.\n\n"
-            "Everything after `--` is passed to mypy unchanged, for both revisions.\n"
-            "Exit code: 0 = no new errors, 1 = new errors, 2 = mypy-diff failed."
+            "Everything after `--` is passed to mypy unchanged, for both revisions."
         ),
     )
 
     @app.command(
+        epilog=_epilog(prog, backend_type),
         context_settings={
             "allow_extra_args": True,
             "ignore_unknown_options": True,
             # Without this, `-h` is an unknown option and goes to mypy, which prints its help
             # instead of a report: two full runs that end in "No change in mypy errors."
             "help_option_names": ["-h", "--help"],
-        }
+        },
     )
     def main(
         ctx: typer.Context,
@@ -88,21 +98,29 @@ def build_app(backend_type: type[GitBackend] | type[JjBackend]) -> typer.Typer:
             bool,
             typer.Option(
                 "--tip",
-                help="With -b NAME, compare against the branch tip instead of the fork point.",
+                help=(
+                    "Compare against the tip of the -b branch instead of its fork point "
+                    "with the target."
+                ),
             ),
         ] = False,
         output_format: Annotated[
-            OutputFormat, typer.Option("--format", help="Output format.")
-        ] = OutputFormat.PRETTY,
+            OutputFormat | None,
+            typer.Option("--format", help="Output format. Default: pretty."),
+        ] = None,
         only: Annotated[
-            Only, typer.Option("--only", help="Show only new errors, only fixed ones, or both.")
-        ] = Only.ALL,
-        show_unchanged: Annotated[
-            bool,
+            Only | None,
             typer.Option(
-                "--show-unchanged", help="List unchanged errors instead of counting them."
+                "--only", help="Show only new errors, only fixed ones, or both. Default: all."
             ),
-        ] = False,
+        ] = None,
+        show_unchanged: Annotated[
+            bool | None,
+            typer.Option(
+                "--show-unchanged/--no-show-unchanged",
+                help="List unchanged errors instead of counting them.",
+            ),
+        ] = None,
         project_dir: Annotated[
             Path | None,
             typer.Option(
@@ -150,15 +168,15 @@ def build_app(backend_type: type[GitBackend] | type[JjBackend]) -> typer.Typer:
             ),
         ] = None,
         fail_on_changed: Annotated[
-            bool,
+            bool | None,
             typer.Option(
-                "--fail-on-changed",
+                "--fail-on-changed/--no-fail-on-changed",
                 help=(
                     "Also exit 1 when a pre-existing error changed its message in place "
                     "(shown as CHANGED)."
                 ),
             ),
-        ] = False,
+        ] = None,
         skip_version_check: Annotated[
             bool, typer.Option("--skip-version-check", help="Do not enforce minimum tool versions.")
         ] = False,
@@ -172,7 +190,7 @@ def build_app(backend_type: type[GitBackend] | type[JjBackend]) -> typer.Typer:
             bool, typer.Option("--version", help="Show the mypy-diff version and exit.")
         ] = False,
     ) -> None:
-        console = make_console(color=output_format is OutputFormat.PRETTY)
+        console = make_console(color=output_format in (None, OutputFormat.PRETTY))
         errors = Console(stderr=True, highlight=False, soft_wrap=True)
 
         if version:
@@ -188,7 +206,7 @@ def build_app(backend_type: type[GitBackend] | type[JjBackend]) -> typer.Typer:
         try:
             code = _run(
                 backend_type=backend_type,
-                console=console,
+                prog=prog,
                 errors=errors,
                 # The indicator shares the stderr console so rich draws messages above the live
                 # region, and never touches stdout, which may be piped JSON.
@@ -246,16 +264,16 @@ def build_app(backend_type: type[GitBackend] | type[JjBackend]) -> typer.Typer:
 def _run(
     *,
     backend_type: type[GitBackend] | type[JjBackend],
-    console: Console,
+    prog: str,
     errors: Console,
     activity: Activity,
     mypy_args: tuple[str, ...],
     base: str | None,
     to: str | None,
     tip: bool,
-    output_format: OutputFormat,
-    only: Only,
-    show_unchanged: bool,
+    output_format: OutputFormat | None,
+    only: Only | None,
+    show_unchanged: bool | None,
     project_dir: Path | None,
     mypy_cmd: str | None,
     cache_dir: Path | None,
@@ -263,10 +281,10 @@ def _run(
     skip_version_check: bool,
     doctor: bool,
     verbose: bool,
-    fail_on_changed: bool = False,
+    fail_on_changed: bool | None = None,
     parallel: bool | None = None,
 ) -> int:
-    check_mypy_args(mypy_args, prog=f"mypy-diff-{backend_type.name}")
+    check_mypy_args(mypy_args, prog=prog)
 
     with activity:
         activity.step("Checking tools")
@@ -274,7 +292,21 @@ def _run(
         backend = backend_type(vcs_tool.command[0], verbose=verbose)
         project = find_project(backend.root(), Path.cwd(), project_dir)
 
-        mypy, mypy_source = resolve_mypy(project.directory, mypy_cmd, project.root)
+        # The command line wins over [tool.mypy-diff], which wins over the built-in defaults.
+        settings = load_settings(project.directory, project.root)
+        output_format = _first(output_format, settings.output_format, OutputFormat.PRETTY)
+        only = _first(only, settings.only, Only.ALL)
+        show_unchanged = _first(show_unchanged, settings.show_unchanged, False)
+        fail_on_changed = _first(fail_on_changed, settings.fail_on_changed, False)
+        parallel = parallel if parallel is not None else settings.parallel
+        if not mypy_args and settings.args:
+            mypy_args = settings.args
+            check_mypy_args(mypy_args, prog=prog)
+        console = make_console(color=output_format is OutputFormat.PRETTY)
+
+        mypy, mypy_source = resolve_mypy(
+            project.directory, mypy_cmd, project.root, configured=settings.mypy_cmd
+        )
 
         if doctor:
             _print_doctor(
@@ -287,13 +319,18 @@ def _run(
                 backend,
                 ResultCache(cache_dir, enabled=not no_cache),
                 (base, to, tip),
+                settings,
             )
             return EXIT_OK
 
         activity.step("Resolving revisions")
-        base_rev, target_rev, base_reason = _resolve_revisions(backend, base, to, tip)
+        base_rev, target_rev, base_reason = _resolve_revisions(
+            backend, base, to, tip, configured=settings.base
+        )
         if verbose:
             _print_verbose_header(errors, backend, base_rev, target_rev, mypy, mypy_source, project)
+            if settings.path is not None:
+                _trace(errors, f"config {settings.path}")
         for warning in backend.warnings:
             errors.print(Text("warning: ", style="bold yellow") + Text(warning))
 
@@ -471,9 +508,18 @@ def _resolve_vcs(name: str, skip_version_check: bool) -> ToolInfo:
 
 
 def _resolve_revisions(
-    backend: VcsBackend, base: str | None, to: str | None, tip: bool
+    backend: VcsBackend,
+    base: str | None,
+    to: str | None,
+    tip: bool,
+    configured: str | None = None,
 ) -> tuple[RevisionInfo, RevisionInfo, str]:
     """The base, the target, and how the base was chosen.
+
+    The base is, in this order: ``-b``; on GitHub Actions, the branch the pull request merges
+    into; ``base`` from [tool.mypy-diff] (``configured``); the latest pushed ancestor. The pull
+    request's own target beats the file because it is never wrong for that pull request — a
+    PR into a release branch must not be compared with main.
 
     The target is resolved first: the base is always derived from it, never from HEAD/@.
     """
@@ -484,14 +530,32 @@ def _resolve_revisions(
         if ci_branch:
             # A pull-request job: the branch it merges into is the base, not the "latest pushed
             # ancestor" — in CI everything is pushed, so that would be HEAD itself.
-            resolved = backend.resolve_base(backend.remote_branch(ci_branch), target, tip=False)
-            return resolved, target, f"fork point with {ci_branch} (GITHUB_BASE_REF)"
+            resolved = backend.resolve_base(backend.remote_branch(ci_branch), target, tip=tip)
+            how = "tip of" if tip else "fork point with"
+            return resolved, target, f"{how} {ci_branch} (GITHUB_BASE_REF)"
+        if configured is not None:
+            resolved = backend.resolve_base(configured, target, tip)
+            return resolved, target, f"{backend.base_reason}, from [tool.mypy-diff]"
+        if tip:
+            raise MypyDiffError(
+                "--tip needs a branch: it compares against that branch's tip instead of its "
+                "fork point.",
+                "Name the branch with -b, e.g. `-b main --tip`.",
+            )
         # The default base is the latest pushed named ancestor, which is already a fork point.
         resolved = backend.default_base(target)
         return resolved, target, backend.base_reason
 
     resolved = backend.resolve_base(base, target, tip)
     return resolved, target, backend.base_reason
+
+
+def _first[T](*choices: T | None) -> T:
+    """The first choice that is set: command line, then config file, then built-in default."""
+    for choice in choices:
+        if choice is not None:
+            return choice
+    raise AssertionError("the last choice is the built-in default and is never None")
 
 
 def _ci_target_branch() -> str:
@@ -835,6 +899,7 @@ def _print_doctor(
     backend: VcsBackend,
     cache: ResultCache,
     revisions: tuple[str | None, str | None, bool],
+    settings: Settings,
 ) -> None:
     """Everything a run would use, and what would go wrong with it — without running mypy."""
 
@@ -855,11 +920,20 @@ def _print_doctor(
     else:
         row("mypy config", config.relative_to(project.root).as_posix())
     targets = configured_targets(config) if config is not None else []
-    row("targets", ", ".join(targets) if targets else "none configured: pass them after `--`")
+    if settings.args:
+        row("targets", f"{' '.join(settings.args)}  (args in [tool.mypy-diff])")
+    else:
+        row("targets", ", ".join(targets) if targets else "none configured: pass them after `--`")
+    if settings.path is None:
+        row("settings", "none ([tool.mypy-diff] in pyproject.toml)")
+    else:
+        row("settings", f"{settings.path.relative_to(project.root).as_posix()}  [tool.mypy-diff]")
 
     base, to, tip = revisions
     try:
-        base_rev, target_rev, reason = _resolve_revisions(backend, base, to, tip)
+        base_rev, target_rev, reason = _resolve_revisions(
+            backend, base, to, tip, configured=settings.base
+        )
     except MypyDiffError as failure:
         row("base", f"cannot be determined: {failure.message}")
     else:
@@ -897,3 +971,49 @@ def jj_main() -> None:
 
 def git_main() -> None:
     build_app(GitBackend)()
+
+
+def main() -> None:
+    """`mypy-diff`: whichever of jj and git manages the current directory."""
+    build_app(detect_backend(Path.cwd()), prog="mypy-diff")()
+
+
+def detect_backend(start: Path) -> type[GitBackend] | type[JjBackend]:
+    """The backend for the repository around ``start``: the nearest `.jj` or `.git` wins.
+
+    A colocated repository has both, and jj is preferred there: it sees the working copy the
+    way the user works with it. Without jj installed git reads the same commits, so it is used
+    instead of failing; a `.jj` alone still selects jj, whose preflight then explains what is
+    missing. Outside any repository it is git, which says so.
+    """
+    for directory in (start, *start.parents):
+        if (directory / ".jj").is_dir():
+            if (directory / ".git").exists() and shutil.which("jj") is None:
+                return GitBackend
+            return JjBackend
+        if (directory / ".git").exists():
+            return GitBackend
+    return GitBackend
+
+
+def _epilog(prog: str, backend_type: type[GitBackend] | type[JjBackend]) -> str:
+    """Examples and exit codes. `\\b` keeps click from re-wrapping a paragraph."""
+    last_commit = "@-" if backend_type is JjBackend else "HEAD"
+    examples = [
+        (prog, "new errors since the last pushed commit"),
+        (f"{prog} -b main", "... since the branch forked from main"),
+        (f"{prog} -b main --tip", "... compared with main as it is now"),
+        (f"{prog} --to {last_commit}", "the last commit, without uncommitted changes"),
+        (f"{prog} -- src tests", "check src and tests (arguments for mypy)"),
+        (f"{prog} --format github", "annotations for GitHub Actions"),
+    ]
+    width = max(len(command) for command, _ in examples)
+    lines = "\n".join(f"  {command:<{width}}  {what}" for command, what in examples)
+    return (
+        f"\b\nExamples:\n{lines}\n\n"
+        "Defaults for the options can be kept in [tool.mypy-diff] in pyproject.toml.\n\n"
+        "\b\nExit codes:\n"
+        "  0  no new errors\n"
+        "  1  new errors (with --fail-on-changed, also changed ones)\n"
+        "  2  mypy-diff itself failed"
+    )

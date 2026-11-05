@@ -83,15 +83,19 @@ class MissingTarget(MypyDiffError):
 
 
 def resolve_mypy(
-    project: Path, explicit: str | None = None, repo_root: Path | None = None
+    project: Path,
+    explicit: str | None = None,
+    repo_root: Path | None = None,
+    configured: str | None = None,
 ) -> tuple[ToolInfo, str]:
     """Find a usable mypy. Returns the tool and a human-readable description of how.
 
-    Order: --mypy-cmd, $MYPY_DIFF_MYPY, the active virtualenv, the project's .venv,
-    `uv run --project`, the repository root's .venv (when the project lives in a
-    subdirectory), then PATH.
+    Order: --mypy-cmd, $MYPY_DIFF_MYPY, ``mypy-cmd`` in [tool.mypy-diff] (``configured``), the
+    active virtualenv, the project's .venv, `uv run --project`, the repository root's .venv
+    (when the project lives in a subdirectory), then PATH. The variable beats the file: it is
+    how one machine — a CI runner — overrides what the team set.
     """
-    for command, source in _mypy_candidates(project, explicit, repo_root):
+    for command, source in _mypy_candidates(project, explicit, repo_root, configured):
         tool = probe("mypy", command)
         if tool is not None:
             return require("mypy", tool, MIN_MYPY), source
@@ -160,7 +164,10 @@ def _names_project(argument: str) -> bool:
 
 
 def _mypy_candidates(
-    project: Path, explicit: str | None, repo_root: Path | None = None
+    project: Path,
+    explicit: str | None,
+    repo_root: Path | None = None,
+    configured: str | None = None,
 ) -> list[tuple[tuple[str, ...], str]]:
     candidates: list[tuple[tuple[str, ...], str]] = []
 
@@ -172,6 +179,11 @@ def _mypy_candidates(
     from_env = os.environ.get("MYPY_DIFF_MYPY")
     if from_env:
         candidates.append((anchor_command(split_command(from_env), project), "$MYPY_DIFF_MYPY"))
+        return candidates
+
+    if configured:
+        command = anchor_command(split_command(configured), project)
+        candidates.append((command, "mypy-cmd in [tool.mypy-diff]"))
         return candidates
 
     active_venv = os.environ.get("VIRTUAL_ENV")
