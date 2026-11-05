@@ -1450,6 +1450,12 @@ def test_a_different_prepare_command_is_not_served_from_the_cache(
     assert "1 unchanged error " in second.stdout, second.output
 
 
+def test_doctor_shows_the_isolated_target_and_the_prepare_command(repo: Repo) -> None:
+    result = invoke(repo, "--doctor", "--isolated", "--prepare", "make proto")
+    assert "checked out on its own" in result.stdout
+    assert "prepare          make proto  (in every checkout, before mypy)" in result.stdout
+
+
 def test_a_failing_prepare_command_fails_the_run(repo: Repo) -> None:
     command = f'"{sys.executable}" -c "import sys; print(\'boom\'); sys.exit(3)"'
     repo.write("src/clean.py", repo.read("src/clean.py") + "\n# touched\n")

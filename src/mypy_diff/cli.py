@@ -403,6 +403,8 @@ def _run(
                 mypy_args,
                 args_from_settings,
                 staged=staged,
+                isolated=isolated,
+                prepare=prepare,
             )
             return EXIT_OK
 
@@ -1148,6 +1150,8 @@ def _print_doctor(
     mypy_args: tuple[str, ...] = (),
     args_from_settings: bool = False,
     staged: bool = False,
+    isolated: bool = False,
+    prepare: str | None = None,
 ) -> None:
     """Everything a run would use, and what would go wrong with it — without running mypy."""
 
@@ -1190,13 +1194,15 @@ def _print_doctor(
     base, to, tip = revisions
     try:
         base_rev, target_rev, reason = _resolve_revisions(
-            backend, base, to, tip, configured=settings.base, staged=staged
+            backend, base, to, tip, configured=settings.base, staged=staged, isolated=isolated
         )
     except MypyDiffError as failure:
         row("base", f"cannot be determined: {failure.message}")
     else:
         row("base", f"{base_rev.label()}  ({reason})")
         row("target", target_rev.label())
+    if prepare:
+        row("prepare", f"{prepare}  (in every checkout, before mypy)")
     if backend.is_shallow():
         row("shallow clone", "yes: a fork point outside the fetched history cannot be found")
 
