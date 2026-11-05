@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -341,3 +342,97 @@ def test_a_tag_is_not_replaced_by_a_branch_of_the_same_name(
     git = backend(git_repo)
     assert git.resolve_base("release", git.working_copy(), tip=False).commit_id == tagged
     assert git.warnings == []
+
+
+# ------------------------------------------------------------------ merges
+
+
+def merge_main_into_pushed_feature(
+    repo: Repo, short_tmp_path: Path, *, commit_merge: bool = True
+) -> tuple[str, str]:
+    """feature is pushed, a colleague pushes to main, the user merges main in, unpushed.
+
+    Returns (origin/feature, origin/main).
+    """
+    assert GIT is not None
+    run([GIT, "checkout", "-q", "-b", "feature"], cwd=repo.root)
+    repo.write("src/feature.py", "z: int = 3\n")
+    commit(repo, "feature work")
+    run([GIT, "push", "-q", "-u", "origin", "feature"], cwd=repo.root)
+    main = colleague_pushes_to_main(repo, short_tmp_path)
+    run([GIT, "fetch", "-q"], cwd=repo.root)
+    feature = backend(repo).resolve("origin/feature").commit_id
+    merge = [GIT, "merge", "-q", "--no-ff", "origin/main"]
+    run([*merge, "-m", "merge main"] if commit_merge else [*merge, "--no-commit"], cwd=repo.root)
+    return feature, main
+
+
+def parents(repo: Repo, commit_id: str) -> set[str]:
+    assert GIT is not None
+    line = run([GIT, "rev-list", "--parents", "-n", "1", commit_id], cwd=repo.root).stdout
+    return set(line.split()[1:])
+
+
+def tree(repo: Repo, revision: str) -> str:
+    assert GIT is not None
+    return run([GIT, "rev-parse", f"{revision}^{{tree}}"], cwd=repo.root).stdout.strip()
+
+
+def test_after_merging_main_the_base_is_the_merge_of_what_is_pushed(
+    git_repo: Repo, short_tmp_path: Path
+) -> None:
+    """The merge's first parent alone would make everything main brought in look like yours."""
+    feature, main = merge_main_into_pushed_feature(git_repo, short_tmp_path)
+    git = backend(git_repo)
+
+    base = git.default_base()
+
+    assert parents(git_repo, base.commit_id) == {feature, main}
+    assert tree(git_repo, base.commit_id) == tree(git_repo, "HEAD")
+    # The same merge gets the same id, so the result cache can recognise it.
+    assert backend(git_repo).default_base().commit_id == base.commit_id
+
+
+def test_in_the_middle_of_a_merge_the_base_includes_the_other_side(
+    git_repo: Repo, short_tmp_path: Path
+) -> None:
+    feature, main = merge_main_into_pushed_feature(git_repo, short_tmp_path, commit_merge=False)
+    base = backend(git_repo).default_base()
+    assert parents(git_repo, base.commit_id) == {feature, main}
+
+
+def test_a_conflicting_merge_falls_back_to_the_trunk_with_a_warning(
+    git_repo: Repo, short_tmp_path: Path
+) -> None:
+    assert GIT is not None
+    run([GIT, "checkout", "-q", "-b", "feature"], cwd=git_repo.root)
+    git_repo.write("src/clean.py", "mine = 1\n")
+    commit(git_repo, "feature edits clean.py")
+    run([GIT, "push", "-q", "-u", "origin", "feature"], cwd=git_repo.root)
+    other = short_tmp_path / "colleague"
+    remote = str(git_repo.root.parent / "remote.git")
+    run([GIT, "clone", "-q", "--branch", "main", remote, str(other)], cwd=short_tmp_path)
+    run([GIT, "config", "user.email", "c@example.com"], cwd=other)
+    run([GIT, "config", "user.name", "Colleague"], cwd=other)
+    (other / "src" / "clean.py").write_text("theirs = 2\n", encoding="utf-8")
+    run([GIT, "commit", "-qam", "main edits clean.py"], cwd=other)
+    run([GIT, "push", "-q", "origin", "main"], cwd=other)
+    run([GIT, "fetch", "-q"], cwd=git_repo.root)
+    subprocess.run(
+        [GIT, "merge", "-q", "origin/main"], cwd=git_repo.root, capture_output=True, check=False
+    )
+    git_repo.write("src/clean.py", "mine = 1\ntheirs = 2\n")
+    commit(git_repo, "merge main, resolved")
+
+    git = backend(git_repo)
+    base = git.default_base()
+
+    assert base.commit_id == git.resolve("origin/main").commit_id
+    assert any("cannot be merged cleanly" in warning for warning in git.warnings)
+
+
+def test_mid_merge_fork_point_counts_the_merged_side(git_repo: Repo, short_tmp_path: Path) -> None:
+    """`-b main` while merging main in: main's commits are not the user's."""
+    _, main = merge_main_into_pushed_feature(git_repo, short_tmp_path, commit_merge=False)
+    git = backend(git_repo)
+    assert git.resolve_base("origin/main", git.working_copy(), tip=False).commit_id == main
