@@ -272,7 +272,8 @@ Two caches live side by side, in a per-user directory from
   version, mypy arguments and a fingerprint of mypy's environment: the installed packages and
   their versions (dependencies, stubs, plugins), the Python version, `MYPYPATH` and the user-level
   mypy config. A commit is immutable, but what mypy resolves its imports against is not —
-  installing a stub package must not leave a stale base behind. Written for any revision that
+  installing a stub package must not leave a stale base behind. If mypy's interpreter cannot be
+  asked what is installed, the result cache is skipped for that run. Written for any revision that
   resolves to a concrete commit, so repeat runs skip that analysis entirely. The dirty working
   copy is never cached, and neither is a run that did not finish cleanly. Tiny — a few hundred
   bytes per entry.

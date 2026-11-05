@@ -321,3 +321,23 @@ def test_a_shallow_merge_commit_forks_from_its_recorded_parent(
     git = shallow_clone(git_repo, short_tmp_path, "pr-merge")
     base = git.resolve_base("origin/main", git.working_copy(), tip=False)
     assert base.commit_id == main_tip
+
+
+def test_a_tag_is_not_replaced_by_a_branch_of_the_same_name(
+    git_repo: Repo, short_tmp_path: Path
+) -> None:
+    """`-b release` naming a tag means that tag, even when origin/release is a newer branch."""
+    assert GIT is not None
+    tagged = backend(git_repo).resolve("HEAD").commit_id
+    run([GIT, "tag", "release"], cwd=git_repo.root)
+    pushed = colleague_pushes_to_main(git_repo, short_tmp_path)
+    run([GIT, "fetch", "-q"], cwd=git_repo.root)
+    run([GIT, "push", "-q", "origin", f"{pushed}:refs/heads/release"], cwd=git_repo.root)
+    run([GIT, "fetch", "-q"], cwd=git_repo.root)
+    run([GIT, "checkout", "-q", "-b", "feature", "origin/main"], cwd=git_repo.root)
+    git_repo.write("src/feature.py", "z: int = 3\n")
+    commit(git_repo, "feature work")
+
+    git = backend(git_repo)
+    assert git.resolve_base("release", git.working_copy(), tip=False).commit_id == tagged
+    assert git.warnings == []

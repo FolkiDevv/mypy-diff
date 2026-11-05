@@ -632,6 +632,17 @@ def test_an_environment_change_misses_the_cache(
     assert "cache hit" not in invoke(repo, "-v", "--", "src", cache=cache).output
 
 
+def test_an_uninspectable_environment_turns_the_result_cache_off(
+    repo: Repo, short_tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A key that cannot tell environments apart would hand back a stale base."""
+    monkeypatch.setattr("mypy_diff.cli.environment_fingerprint", lambda *args: None)
+    cache = short_tmp_path / "cache"
+    invoke(repo, "--", "src", cache=cache)
+    assert list(cache.glob("*.json")) == []
+    assert "cache hit" not in invoke(repo, "-v", "--", "src", cache=cache).output
+
+
 def test_version_flag(repo: Repo) -> None:
     result = invoke(repo, "--version")
     assert result.exit_code == EXIT_OK

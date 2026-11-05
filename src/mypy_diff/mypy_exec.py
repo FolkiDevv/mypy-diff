@@ -430,11 +430,17 @@ _FINGERPRINT_SCRIPT = (
     "}))"
 )
 
+#: Launcher options whose value may be a path that happens to end in `mypy`
+#: (`uv run --project ~/src/mypy mypy`): that value is not the program.
+_LAUNCHER_VALUE_OPTIONS = frozenset(
+    {"--project", "--directory", "--with", "--python", "--from", "--env-file", "-C", "-p"}
+)
+
 #: Where mypy looks for a user-level config when the project has none (mypy/defaults.py).
 _USER_CONFIG_FILES = ("~/.config/mypy/config", "~/.mypy.ini")
 
 
-def environment_fingerprint(mypy: ToolInfo, project: Path) -> str:
+def environment_fingerprint(mypy: ToolInfo, project: Path) -> str | None:
     """A digest of everything outside the revision that changes what mypy reports.
 
     The result cache stores a base revision's diagnostics. They stay valid only as long as mypy
@@ -442,13 +448,16 @@ def environment_fingerprint(mypy: ToolInfo, project: Path) -> str:
     cached base and a freshly checked target disagree, and pre-existing errors come out NEW.
     Folding this digest into the cache key turns such a change into a cache miss instead.
 
-    Best effort: when the interpreter cannot be asked, the digest still covers the command and
-    the version, so it never fails a run.
+    None when mypy's interpreter cannot be asked what is installed. A key without that part
+    could not tell two environments apart, so the caller must not use the result cache then.
     """
+    report = _interpreter_report(mypy.command, project)
+    if not report:
+        return None
     parts: dict[str, object] = {
         "command": list(mypy.command),
         "version": mypy.raw_version,
-        "environment": _interpreter_report(mypy.command, project),
+        "environment": report,
         "MYPYPATH": os.environ.get("MYPYPATH", ""),
         "user_config": _user_config_digest(),
     }
@@ -457,18 +466,37 @@ def environment_fingerprint(mypy: ToolInfo, project: Path) -> str:
 
 
 def _interpreter_command(command: tuple[str, ...]) -> tuple[str, ...] | None:
-    """Turn the command that runs mypy into one that runs Python in the same environment."""
-    if not command:
+    """Turn the command that runs mypy into one that runs Python in the same environment.
+
+    Arguments after mypy (``mypy --strict``) say nothing about the environment and are dropped.
+    """
+    for index in range(len(command) - 1):
+        if command[index : index + 2] == ("-m", "mypy"):
+            # `python -m mypy ...`, `uv run python -m mypy ...`.
+            return (*command[:index], "-c", _FINGERPRINT_SCRIPT)
+
+    position = next(
+        (
+            i
+            for i, token in enumerate(command)
+            if Path(token).stem.lower() == "mypy"
+            and (i == 0 or command[i - 1] not in _LAUNCHER_VALUE_OPTIONS)
+        ),
+        None,
+    )
+    if position is None:
         return None
-    if len(command) >= 3 and command[-2:] == ("-m", "mypy"):
-        # `python -m mypy`, `uv run python -m mypy`.
-        return (*command[:-2], "-c", _FINGERPRINT_SCRIPT)
-    executable = Path(command[-1])
-    if executable.stem.lower() != "mypy":
-        return None
-    if len(command) > 1:
+    if position > 0:
         # A launcher such as `uv run mypy` or `poetry run mypy`: same launcher, other program.
-        return (*command[:-1], "python", "-c", _FINGERPRINT_SCRIPT)
+        return (*command[:position], "python", "-c", _FINGERPRINT_SCRIPT)
+
+    executable = Path(command[0])
+    if executable.parent == Path("."):
+        # A bare name is found on PATH, exactly as running it would.
+        found = shutil.which(command[0])
+        if found is None:
+            return None
+        executable = Path(found)
     # A script in an environment's bin/ (Scripts/ on Windows) sits next to its interpreter.
     for name in ("python.exe", "python") if sys.platform == "win32" else ("python", "python3"):
         interpreter = executable.parent / name

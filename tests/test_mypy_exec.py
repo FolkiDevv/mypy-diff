@@ -350,6 +350,46 @@ class TestEnvironmentFingerprint:
             self.MYPY, tmp_path
         )
 
-    def test_an_unaskable_interpreter_does_not_fail(self, tmp_path: Path) -> None:
+    def test_an_unaskable_interpreter_gives_no_fingerprint(self, tmp_path: Path) -> None:
+        """No fingerprint, so the caller turns the result cache off rather than guess."""
         tool = ToolInfo("mypy", (str(tmp_path / "gone" / "mypy"),), None, "")
-        assert environment_fingerprint(tool, tmp_path)
+        assert environment_fingerprint(tool, tmp_path) is None
+
+    def test_arguments_after_mypy_are_ignored(self) -> None:
+        assert (_interpreter_command(("python", "-m", "mypy", "--strict")) or ())[:2] == (
+            "python",
+            "-c",
+        )
+        assert (_interpreter_command(("uv", "run", "mypy", "--strict", "src/mypy")) or ())[:4] == (
+            "uv",
+            "run",
+            "python",
+            "-c",
+        )
+
+    def test_a_project_path_named_mypy_is_not_the_program(self) -> None:
+        command = ("uv", "run", "--project", "/src/mypy", "mypy")
+        assert (_interpreter_command(command) or ())[:6] == (
+            "uv",
+            "run",
+            "--project",
+            "/src/mypy",
+            "python",
+            "-c",
+        )
+
+    def test_a_bare_name_is_looked_up_on_path(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`--mypy-cmd mypy` used to look for ./python and ./mypy in the current directory."""
+        binaries = tmp_path / "bin"
+        binaries.mkdir()
+        (binaries / "mypy").write_text("", encoding="utf-8")
+        interpreter = binaries / ("python.exe" if os.name == "nt" else "python")
+        interpreter.write_text("", encoding="utf-8")
+        monkeypatch.setattr(
+            "mypy_diff.mypy_exec.shutil.which",
+            lambda name: str(binaries / name) if name == "mypy" else None,
+        )
+        monkeypatch.chdir(tmp_path)
+        assert (_interpreter_command(("mypy", "--strict")) or ())[:2] == (str(interpreter), "-c")

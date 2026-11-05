@@ -340,11 +340,14 @@ class _Fingerprint:
     def __init__(self, mypy: ToolInfo, project: Path) -> None:
         self._mypy = mypy
         self._project = project
+        self._computed = False
         self._value: str | None = None
 
-    def get(self) -> str:
-        if self._value is None:
+    def get(self) -> str | None:
+        """The fingerprint, or None when the environment could not be inspected."""
+        if not self._computed:
             self._value = environment_fingerprint(self._mypy, self._project)
+            self._computed = True
         return self._value
 
 
@@ -365,13 +368,17 @@ def _messages_for(
     activity.step(f"Checking {what}")
 
     cache_key: str | None = None
-    if not revision.is_working_copy and cache.enabled:
+    fingerprint = environment.get() if not revision.is_working_copy and cache.enabled else None
+    if not revision.is_working_copy and cache.enabled and fingerprint is None and verbose:
+        # Without knowing what is installed, a cached base could be from another environment.
+        console.print("[dim]result cache off: could not inspect mypy's environment[/dim]")
+    if fingerprint is not None:
         cache_key = cache.key(
             revision.commit_id,
             mypy.display_version,
             mypy_args,
             project.subdir,
-            environment.get(),
+            fingerprint,
         )
         cached = cache.load(cache_key)
         if cached is not None:

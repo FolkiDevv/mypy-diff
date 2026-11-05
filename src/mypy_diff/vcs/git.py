@@ -179,6 +179,9 @@ class GitBackend:
         if tip:
             return rev
         best = self.fork_point(rev, target)
+        if not self._names_a_branch(revspec, rev):
+            # A tag or a commit id means exactly that revision.
+            return best
         better_spelling: str | None = None
         for spelling in _spellings_of(revspec):
             other = self._describe(spelling)
@@ -202,6 +205,18 @@ class GitBackend:
                 f"yours. To use {rev.short_id} anyway, pass `-b {rev.short_id}`."
             )
         return best
+
+    def _names_a_branch(self, revspec: str, rev: RevisionInfo) -> bool:
+        """Whether ``revspec`` resolved to ``rev`` through a branch, local or remote-tracking."""
+        if not _spellings_of(revspec):
+            return False
+        if self._git.try_out("show-ref", "--verify", f"refs/tags/{revspec}") is not None:
+            return False
+        for ref in (f"refs/heads/{revspec}", *self._remote_refs_named(revspec)):
+            info = self._describe(ref)
+            if info is not None and info.commit_id == rev.commit_id:
+                return True
+        return False
 
     def fork_point(self, rev: RevisionInfo, target: RevisionInfo | None = None) -> RevisionInfo:
         """The common ancestor of ``rev`` and ``target`` (default: the working copy)."""
