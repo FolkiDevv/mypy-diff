@@ -192,6 +192,11 @@ class ResultCache:
         The first base run after the target has run (or the other way round) then finds most
         modules unchanged. Called before either side runs, never while one does: copying a
         cache mypy is writing could copy it half-written.
+
+        Another mypy-diff run on the same project may be seeding at the same moment. So the copy
+        goes to a directory of this run's own and is renamed into place in one step: whichever
+        run renames first wins, and the other only ever removes its own copy — never a cache the
+        winner may already be using.
         """
         if not self.enabled:
             return
@@ -201,9 +206,17 @@ class ResultCache:
             if destination.exists() or not source.is_dir():
                 continue
             try:
-                shutil.copytree(source, destination)
+                staging = Path(tempfile.mkdtemp(prefix=f".{role}-", dir=place))
             except OSError:
-                shutil.rmtree(destination, ignore_errors=True)
+                continue
+            try:
+                shutil.copytree(source, staging, dirs_exist_ok=True)
+                staging.rename(destination)
+            except OSError:
+                pass
+            finally:
+                # Gone already after a successful rename; this run's own copy otherwise.
+                shutil.rmtree(staging, ignore_errors=True)
 
     def _place(self, location: str) -> Path:
         digest = hashlib.sha256(location.encode("utf-8")).hexdigest()[:16]

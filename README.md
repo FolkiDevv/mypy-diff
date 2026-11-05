@@ -354,7 +354,8 @@ First match wins, and `--doctor` tells you which one was used:
 
 1. `--mypy-cmd 'uv run mypy'`
 2. `$MYPY_DIFF_MYPY`
-3. `mypy-cmd` in `[tool.mypy-diff]`
+3. `mypy-cmd` in `[tool.mypy-diff]` (a relative path there is relative to that `pyproject.toml`,
+   wherever you run mypy-diff from)
 
    All three are pinned to the working copy, because the base runs in a temporary checkout: a relative
    path such as `.venv/bin/mypy` is made absolute, and `uv run` gets `--project <project>` so that

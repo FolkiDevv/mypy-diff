@@ -363,6 +363,17 @@ class TestAnchorCommand:
             "--strict",
         )
 
+    def test_a_relative_executable_from_a_file_is_relative_to_that_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`mypy-cmd = ".venv/bin/mypy"` in the root pyproject.toml, run from a subdirectory."""
+        (tmp_path / "src").mkdir()
+        monkeypatch.chdir(tmp_path / "src")
+        relative = os.path.join(".venv", "bin", "mypy")
+        assert anchor_command((relative,), tmp_path, relative_to=tmp_path) == (
+            str(tmp_path / ".venv" / "bin" / "mypy"),
+        )
+
     def test_a_bare_name_is_left_to_path_lookup(self, tmp_path: Path) -> None:
         assert anchor_command(("mypy",), tmp_path) == ("mypy",)
 

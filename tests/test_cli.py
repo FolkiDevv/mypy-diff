@@ -81,6 +81,18 @@ def test_doctor_shows_what_a_run_would_use(repo: Repo, short_tmp_path: Path) -> 
     assert str(short_tmp_path / "cache") in result.stdout
 
 
+def test_doctor_honours_an_explicit_config_file(repo: Repo) -> None:
+    """mypy reads the --config-file after `--`, not the one it would find by itself."""
+    repo.write("custom.ini", "[mypy]\nfiles = lib\n")
+    result = invoke(repo, "--doctor", "--", "--config-file", "custom.ini", "src")
+    assert "mypy config      custom.ini  (--config-file)" in result.stdout
+    assert "targets          --config-file custom.ini src  (after `--`)" in result.stdout
+
+    missing = invoke(repo, "--doctor", "--", "--config-file", "nope.ini")
+    assert "nope.ini  (--config-file: no such file)" in missing.stdout
+    assert "none configured: pass them after `--`" in missing.stdout
+
+
 def test_doctor_warns_about_a_foreign_virtualenv(
     repo: Repo, short_tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -494,6 +506,25 @@ def test_an_unchanged_working_copy_is_checked_once(repo: Repo) -> None:
     assert "the same files as the base" in result.stderr
     assert "checked out" not in result.stderr
     assert "1 unchanged error" in result.stdout
+
+
+def test_an_ignored_module_is_not_compared_with_itself(
+    git_repo: Repo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The tree is unchanged, but mypy checks a file the base checkout cannot have.
+
+    Taking one run for both would report its errors as unchanged, and pass.
+    """
+    monkeypatch.chdir(git_repo.root)
+    (git_repo.root / ".git" / "info").mkdir(parents=True, exist_ok=True)
+    (git_repo.root / ".git" / "info" / "exclude").write_text("generated.py\n", encoding="utf-8")
+    git_repo.write("src/generated.py", BROKEN_SOURCE)
+
+    result = invoke(git_repo, "--", "src")
+
+    assert result.exit_code == EXIT_NEW_ERRORS, result.output
+    assert "src/generated.py:6" in result.stdout
+    assert "the same files as the base" not in result.stderr
 
 
 @pytest.mark.parametrize("flag", ["--parallel", "--no-parallel"])
@@ -1101,6 +1132,35 @@ def test_the_config_mypy_command_is_used(repo: Repo, monkeypatch: pytest.MonkeyP
 
     assert "mypy found via   mypy-cmd in [tool.mypy-diff]" in result.stdout
     assert "settings         pyproject.toml  [tool.mypy-diff]" in result.stdout
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="needs an executable script")
+def test_a_relative_config_mypy_command_works_from_a_subdirectory(
+    repo: Repo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The path is relative to the pyproject.toml it is written in, not to where you are."""
+    monkeypatch.delenv("MYPY_DIFF_MYPY", raising=False)
+    script = repo.root / "tools" / "mypy"
+    script.parent.mkdir()
+    script.write_text(f'#!/bin/sh\nexec "{sys.executable}" -m mypy "$@"\n', encoding="utf-8")
+    script.chmod(0o755)
+    configure(repo, 'mypy-cmd = "tools/mypy"\n')
+    monkeypatch.chdir(repo.root / "src")
+
+    app = build_app(JjBackend if repo.vcs == "jj" else GitBackend)
+    result = runner.invoke(app, ["--doctor"], catch_exceptions=False)
+
+    assert result.exit_code == EXIT_OK, result.output
+    assert f"({script})" in result.stdout
+
+
+def test_doctor_shows_the_targets_a_run_would_use(repo: Repo) -> None:
+    configure(repo, 'args = ["src"]\n')
+    from_config = invoke(repo, "--doctor")
+    assert "targets          src  (args in [tool.mypy-diff])" in from_config.stdout
+
+    overridden = invoke(repo, "--doctor", "--", "src/clean.py")
+    assert "targets          src/clean.py  (after `--`)" in overridden.stdout
 
 
 def test_on_a_pull_request_its_target_beats_the_configured_base(

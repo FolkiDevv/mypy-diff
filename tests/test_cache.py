@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 from contextlib import ExitStack
 from pathlib import Path
 
@@ -317,3 +318,43 @@ def test_clear_leaves_unrelated_files_alone(tmp_path: Path) -> None:
 
 def test_clear_on_a_missing_directory_is_zero(tmp_path: Path) -> None:
     assert cache(tmp_path).clear() == 0
+
+
+def test_seed_leaves_a_concurrent_runs_copy_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two runs seeding at once: the loser must not delete what the winner put in place."""
+    subject = cache(tmp_path)
+    with ExitStack() as stack:
+        target = subject.mypy_cache_dir("target", stack, HERE)
+    (target / "cache.0.db").write_bytes(b"warm")
+    base = target.parent / "base"
+    real_copytree = shutil.copytree
+
+    def copy_while_another_run_wins(source: Path, destination: Path, **kwargs: object) -> object:
+        base.mkdir()
+        (base / "cache.0.db").write_bytes(b"the other run's")
+        return real_copytree(source, destination, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(shutil, "copytree", copy_while_another_run_wins)
+    subject.seed(HERE)
+
+    assert (base / "cache.0.db").read_bytes() == b"the other run's"
+    assert sorted(p.name for p in target.parent.iterdir()) == ["base", "target"]
+
+
+def test_a_failed_seed_leaves_nothing_behind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    subject = cache(tmp_path)
+    with ExitStack() as stack:
+        target = subject.mypy_cache_dir("target", stack, HERE)
+    (target / "cache.0.db").write_bytes(b"warm")
+
+    def fail(*_args: object, **_kwargs: object) -> object:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(shutil, "copytree", fail)
+    subject.seed(HERE)
+
+    assert sorted(p.name for p in target.parent.iterdir()) == ["target"]
