@@ -1456,6 +1456,45 @@ def test_doctor_shows_the_isolated_target_and_the_prepare_command(repo: Repo) ->
     assert "prepare          make proto  (in every checkout, before mypy)" in result.stdout
 
 
+GENERATED_USES_ADD = "from clean import add\n\nvalue: str = add(1, 2)\n"
+ADD_RETURNS_FLOAT = (
+    "def add(a: int, b: int) -> float:\n    return a + b\n\n\n"
+    "def greet(name: str) -> str:\n    return 'hello ' + name\n"
+)
+
+
+def test_prepared_code_is_matched_by_the_text_mypy_read(repo: Repo, short_tmp_path: Path) -> None:
+    """Generated code exists in no commit. Its error, reworded because an imported signature
+    changed, must be CHANGED, not NEW plus FIXED: matching needs the prepared text."""
+    command = write_generator(short_tmp_path, GENERATED_USES_ADD)
+    repo.write("src/clean.py", ADD_RETURNS_FLOAT)
+
+    result = invoke(repo, "--isolated", "--prepare", command, "--", "src")
+
+    assert result.exit_code == EXIT_OK, result.output
+    assert "~ CHANGED (1)" in result.stdout
+    assert "NEW" not in result.stdout
+
+
+def test_a_baseline_keeps_the_text_of_prepared_files(repo: Repo, short_tmp_path: Path) -> None:
+    command = write_generator(short_tmp_path, GENERATED_USES_ADD)
+    baseline = short_tmp_path / "baseline.json"
+    repo.write("src/clean.py", repo.read("src/clean.py") + "\n# touched\n")
+    recorded = invoke(
+        repo, "--isolated", "--prepare", command, "--write-baseline", str(baseline), "--", "src"
+    )
+    assert recorded.exit_code == EXIT_OK, recorded.output
+    assert "src/generated.py" in json.loads(baseline.read_text(encoding="utf-8"))["generated"]
+    repo.write("src/clean.py", ADD_RETURNS_FLOAT)
+
+    result = invoke(
+        repo, "--isolated", "--prepare", command, "--baseline", str(baseline), "--", "src"
+    )
+
+    assert result.exit_code == EXIT_OK, result.output
+    assert "~ CHANGED (1)" in result.stdout
+
+
 def test_a_failing_prepare_command_fails_the_run(repo: Repo) -> None:
     command = f'"{sys.executable}" -c "import sys; print(\'boom\'); sys.exit(3)"'
     repo.write("src/clean.py", repo.read("src/clean.py") + "\n# touched\n")

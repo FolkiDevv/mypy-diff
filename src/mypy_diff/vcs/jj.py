@@ -159,7 +159,8 @@ class JjBackend:
 
     def default_base(self, target: RevisionInfo | None = None) -> RevisionInfo:
         """The latest pushed (or else named) ancestor of ``target``, default the working copy."""
-        if target is None or target.is_working_copy:
+        # A snapshot (--isolated) is @ itself, checked out: the same commit, so the same base.
+        if target is None or target.is_working_copy or target.is_snapshot:
             ancestors, proper, parent = "::@", "::@-", "@-"
         else:
             proper = f"::({target.commit_id}-)"
@@ -240,7 +241,10 @@ class JjBackend:
         fork_point(x) == heads(::x_1 & ... & ::x_N); when ``rev`` is already an ancestor of the
         target this resolves to ``rev`` itself, which is what we want.
         """
-        other = "@" if target is None or target.is_working_copy else target.commit_id
+        if target is None or target.is_working_copy or target.is_snapshot:
+            other = "@"  # a snapshot (--isolated) is @ itself
+        else:
+            other = target.commit_id
         found = self._log(f"fork_point({rev.commit_id} | {other})", check=False)
         return found[0] if found else rev
 

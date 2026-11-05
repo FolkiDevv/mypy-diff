@@ -196,7 +196,10 @@ it.
 
 `--isolated` removes the difference: the working copy — tracked and untracked files as they are on
 disk, deletions included, ignored files not — becomes a commit of its own and is checked out like
-the base. Your staging area is not touched. With jj, that commit is simply `@`. The cost is a second
+the base. Your staging area is not touched, and edits hidden from `git add` by `assume-unchanged`
+or `skip-worktree` are included (a file a sparse checkout leaves out stays as committed). In the
+middle of a merge, the snapshot has both sides as parents, so the base accounts for what the merge
+brought in. With jj, the snapshot is simply `@`, and its base is the one `@` would get. The cost is a second
 checkout, and the two runs no longer happen side by side.
 
 `--prepare CMD` runs a shell command in every checkout before mypy does, in the project directory:
@@ -208,7 +211,10 @@ mypy-diff --isolated --prepare "make proto" -- src
 
 The command runs with your environment, and its output is shown only when it fails (which ends the
 run with exit code `2`). It never runs in the working copy itself. It is part of the result cache
-key: another command means another result. Both options can live in `[tool.mypy-diff]`:
+key: another command means another result. Matching uses the text mypy read: the prepared files,
+not the commit's, so an error in generated code is followed through edits like any other. A
+baseline recorded this way stores the text of the files with errors that `--prepare` made or
+changed, under `generated`. Both options can live in `[tool.mypy-diff]`:
 `isolated = true`, `prepare = "make proto"`.
 
 ### Pre-commit hooks

@@ -113,6 +113,19 @@ def test_snapshot_is_the_working_copy_commit(jj_repo: Repo) -> None:
     assert jj.file_at(snapshot, "src/untracked.py") == "new: int = 2\n"
 
 
+def test_a_snapshot_gets_the_base_of_the_working_copy(jj_repo: Repo) -> None:
+    """The snapshot is @ itself: an @ that is already pushed is its own base, not its parent."""
+    assert JJ is not None
+    jj = JjBackend(JJ, cwd=jj_repo.root, verbose=True)
+    jj.default_base()
+    expected = jj.notes[-1]
+
+    jj.default_base(jj.snapshot())
+
+    assert jj.notes[-1] == expected
+    assert "@" in expected
+
+
 def test_file_at_reads_the_committed_content(jj_repo: Repo) -> None:
     jj = backend(jj_repo)
     jj_repo.write("src/clean.py", "COMPLETELY DIFFERENT\n")

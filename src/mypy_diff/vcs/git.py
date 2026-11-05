@@ -301,12 +301,17 @@ class GitBackend:
 
         Built in an index of its own, a copy of the real one so unchanged files need not be hashed
         again; the repository's index, the user's staging, is never touched.
+
+        In the middle of a merge the working copy already holds the other side, so MERGE_HEAD
+        is a parent too: base selection and fork points then account for what the merge brought
+        in, exactly as they do for the working copy itself.
         """
         head = self._git.try_out("rev-parse", "-q", "--verify", "HEAD^{commit}")
         if not head:
             raise MypyDiffError(
                 "--isolated checks the working copy on top of HEAD, and there is no commit yet."
             )
+        merge_head = self._git.try_out("rev-parse", "-q", "--verify", "MERGE_HEAD^{commit}")
         with tempfile.TemporaryDirectory(prefix="mypy-diff-index-") as scratch:
             index = Path(scratch) / "index"
             current = self._git.try_out("rev-parse", "--git-path", "index")
@@ -314,11 +319,13 @@ class GitBackend:
             env = {"GIT_INDEX_FILE": str(index)}
             if source is not None and source.is_file():
                 shutil.copyfile(source, index)
+                self._unflag_present_files(env)
             else:
                 self._git.run("read-tree", head, env=env)
             self._git.run("add", "--all", "--", ".", env=env)
             tree = self._git.run("write-tree", env=env).stdout.strip()
-        commit = self._synthetic_commit(tree, [head], "mypy-diff: working copy")
+        parents = [head, merge_head] if merge_head else [head]
+        commit = self._synthetic_commit(tree, parents, "mypy-diff: working copy")
         if commit is None:
             raise MypyDiffError("Could not make a commit of the working copy.")
         return RevisionInfo(
@@ -327,6 +334,30 @@ class GitBackend:
             description="working copy",
             is_snapshot=True,
         )
+
+    def _unflag_present_files(self, env: dict[str, str]) -> None:
+        """Clear assume-unchanged and skip-worktree in a private index, for files on disk.
+
+        `git add` trusts both flags and would keep the indexed content of an edited file. A
+        skip-worktree file that is *not* on disk is a sparse checkout leaving it out: it keeps
+        its flag, so the snapshot keeps the committed file instead of recording a deletion.
+        """
+        listing = self._git.run("ls-files", "-v", "-z", env=env).stdout
+        root = self.root()
+        # `ls-files -v`: a lowercase tag is assume-unchanged, "S" skip-worktree. One flag per
+        # update-index call: given both, git applies only one of them.
+        assumed: list[str] = []
+        skipped: list[str] = []
+        for entry in listing.split("\0"):
+            if len(entry) < 3 or not os.path.lexists(root / entry[2:]):
+                continue
+            if entry[0].islower():
+                assumed.append(entry[2:])
+            if entry[0] in "Ss":
+                skipped.append(entry[2:])
+        for flag, paths in (("--no-assume-unchanged", assumed), ("--no-skip-worktree", skipped)):
+            for start in range(0, len(paths), 100):
+                self._git.run("update-index", flag, "--", *paths[start : start + 100], env=env)
 
     def remote_branch(self, name: str) -> str:
         """How to name the remote-tracking copy of a branch, e.g. the CI's target branch."""

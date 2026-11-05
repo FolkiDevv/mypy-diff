@@ -16,7 +16,8 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +38,9 @@ class Baseline:
     mypy_args: tuple[str, ...]
     #: The project directory, relative to the repository root.
     project: str
+    #: Text of the files with errors that the recorded revision does not hold, by path: what
+    #: --prepare made or rewrote in the checkout. Matching follows lines through it.
+    generated: Mapping[str, str] = field(default_factory=dict)
 
     @property
     def has_file_contents(self) -> bool:
@@ -84,8 +88,13 @@ def write_baseline(
     mypy_version: str,
     mypy_args: tuple[str, ...],
     project: str,
+    generated: Mapping[str, str] | None = None,
 ) -> int:
     """Record ``messages`` in ``path``; returns how many were recorded.
+
+    ``generated`` is the text of the files whose errors were found in text the revision does
+    not hold (``--prepare`` made or rewrote them). It is recorded too: a later comparison could
+    not read it from the revision, and the revision's text, where it has one, is the wrong one.
 
     Notes on their own are left out: they are never compared. The file is sorted and indented so
     that a committed baseline changes by one line per error.
@@ -108,6 +117,7 @@ def write_baseline(
             "description": revision.description,
             "working_copy": revision.is_working_copy,
         },
+        "generated": dict(sorted((generated or {}).items())),
         "messages": [message.to_json() for message in kept],
     }
     temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
@@ -119,6 +129,14 @@ def write_baseline(
         temporary.unlink(missing_ok=True)
         raise MypyDiffError(f"Could not write the baseline {path}: {failure}") from failure
     return len(kept)
+
+
+def _texts(value: object) -> dict[str, str]:
+    if not isinstance(value, dict) or not all(
+        isinstance(path, str) and isinstance(text, str) for path, text in value.items()
+    ):
+        raise TypeError("`generated` must map paths to file contents")
+    return value
 
 
 def read_baseline(path: Path, prog: str = "mypy-diff") -> Baseline:
@@ -157,6 +175,7 @@ def read_baseline(path: Path, prog: str = "mypy-diff") -> Baseline:
             mypy_version=str(raw["mypy_version"]),
             mypy_args=tuple(str(argument) for argument in raw.get("mypy_args", ())),
             project=str(raw.get("project", ".")),
+            generated=_texts(raw.get("generated", {})),
         )
     except (KeyError, TypeError, ValueError, AttributeError) as failure:
         raise MypyDiffError(f"{path} is not a valid mypy-diff baseline: {failure!r}") from None

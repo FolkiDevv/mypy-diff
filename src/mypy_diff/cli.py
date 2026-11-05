@@ -18,7 +18,7 @@ import shutil
 import subprocess
 import sys
 import traceback
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from pathlib import Path
@@ -436,13 +436,19 @@ def _run(
             activity.step(f"Checking {_describe(target_rev)}")
             run = checked(revision=target_rev, role="target", activity=activity)
             _refuse_missing_targets(run, target_rev)
+            recorded_rev = _as_recorded(backend, target_rev)
             count = write_baseline(
                 record_baseline,
                 run.messages,
-                _as_recorded(backend, target_rev),
+                recorded_rev,
                 mypy.display_version,
                 mypy_args,
                 project.subdir,
+                generated={
+                    path: text
+                    for path, text in run.texts.items()
+                    if backend.file_at(recorded_rev, path) != text
+                },
             )
             errors.print(
                 Text(
@@ -552,6 +558,8 @@ def _run(
                 target_run.messages,
                 project,
                 base_text=recorded is None or recorded.has_file_contents,
+                base_texts=recorded.generated if recorded is not None else base_run.texts,
+                target_texts=target_run.texts,
             )
 
     result = dataclasses.replace(result, base_reason=base_reason)
@@ -765,6 +773,9 @@ class _Checked:
 
     messages: tuple[MypyMessage, ...]
     dropped_targets: tuple[str, ...] = ()
+    #: With --prepare: the text of each file with a diagnostic, as mypy read it in the
+    #: prepared checkout. The commit's own text may differ, or not exist at all.
+    texts: Mapping[str, str] = dataclasses.field(default_factory=dict)
 
 
 def _describe(revision: RevisionInfo) -> str:
@@ -1016,10 +1027,14 @@ def _messages_for(
             # reads is how a dependency that reports no errors gets checked too.
             trace_reads=checkout is not None,
         )
+        texts: dict[str, str] = {}
         if checkout is not None:
             read = [*run.read_files, *(message.path for message in run.messages)]
             reads = working_copy_reads(read, workdir, checkout, project.root, prefix)
             _refuse_working_copy_reads(reads, revision)
+            if prepare:
+                # Read before the checkout goes: matching follows lines through these texts.
+                texts = _texts_in(checkout, _repo_paths(run.messages, project))
 
     if verbose and run.skipped_lines:
         _trace(console, f"skipped {run.skipped_lines} non-JSON line(s) from mypy")
@@ -1039,8 +1054,25 @@ def _messages_for(
             for path in dropped
         )
     if cache_key is not None:
-        cache.store(cache_key, messages, dropped)
-    return _Checked(messages, dropped)
+        cache.store(cache_key, messages, dropped, texts)
+    return _Checked(messages, dropped, texts)
+
+
+def _texts_in(checkout: Path, messages: Iterable[MypyMessage]) -> dict[str, str]:
+    """The text of every file in ``checkout`` that ``messages`` name, by repository path."""
+    root = checkout.resolve()
+    texts: dict[str, str] = {}
+    for message in messages:
+        if message.path in texts:
+            continue
+        location = (root / message.path).resolve()
+        if not location.is_relative_to(root):
+            continue
+        try:
+            texts[message.path] = location.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+    return texts
 
 
 def _run_prepare(command: str, workdir: Path, env: dict[str, str], revision: RevisionInfo) -> None:
@@ -1077,21 +1109,26 @@ def _diff(
     target_messages: tuple[MypyMessage, ...],
     project: Project,
     base_text: bool = True,
+    base_texts: Mapping[str, str] | None = None,
+    target_texts: Mapping[str, str] | None = None,
 ) -> DiffResult:
     """Diff the two message sets, reading file contents lazily for the line-shift tier.
 
-    Without ``base_text`` the base's files are unknown (a baseline recorded from uncommitted
-    changes): the tiers that follow a line through an edit are skipped, rather than fed the text
-    of a commit the errors were not found in.
+    The text a side's errors were found in wins: ``base_texts`` and ``target_texts`` hold it for
+    a checkout --prepare changed, or a baseline's generated files. Otherwise it is the revision's
+    own. Without ``base_text`` the base's files are unknown (a baseline recorded from uncommitted
+    changes): the tiers that follow a line through an edit are skipped, rather than fed text the
+    errors were not found in.
     """
-    base_cache: dict[str, str | None] = {}
-    target_cache: dict[str, str | None] = {}
+    base_cache: dict[str, str | None] = dict(base_texts or {})
+    target_cache: dict[str, str | None] = dict(target_texts or {})
 
     def read_base(path: str) -> str | None:
+        if path in base_cache:
+            return base_cache[path]
         if not base_text:
             return None
-        if path not in base_cache:
-            base_cache[path] = backend.file_at(base_rev, path)
+        base_cache[path] = backend.file_at(base_rev, path)
         return base_cache[path]
 
     def read_target(path: str) -> str | None:

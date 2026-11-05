@@ -550,3 +550,45 @@ def test_mid_merge_fork_point_counts_the_merged_side(git_repo: Repo, short_tmp_p
     _, main = merge_main_into_pushed_feature(git_repo, short_tmp_path, commit_merge=False)
     git = backend(git_repo)
     assert git.resolve_base("origin/main", git.working_copy(), tip=False).commit_id == main
+
+
+def test_a_snapshot_mid_merge_keeps_the_other_side_as_a_parent(
+    git_repo: Repo, short_tmp_path: Path
+) -> None:
+    """The working copy holds what the merge brought in; the snapshot must say where from."""
+    feature, main = merge_main_into_pushed_feature(git_repo, short_tmp_path, commit_merge=False)
+    git = backend(git_repo)
+
+    snapshot = git.snapshot()
+
+    assert parents(git_repo, snapshot.commit_id) == {feature, main}
+    base = git.default_base(snapshot)
+    assert parents(git_repo, base.commit_id) == {feature, main}
+
+
+def test_a_snapshot_sees_edits_behind_index_flags(git_repo: Repo) -> None:
+    """assume-unchanged and skip-worktree make `git add` keep the indexed content."""
+    assert GIT is not None
+    git = backend(git_repo)
+    run([GIT, "update-index", "--assume-unchanged", "src/clean.py"], cwd=git_repo.root)
+    run([GIT, "update-index", "--skip-worktree", "src/legacy.py"], cwd=git_repo.root)
+    git_repo.write("src/clean.py", "edited: int = 1\n")
+    git_repo.write("src/legacy.py", "also_edited: int = 2\n")
+
+    snapshot = git.snapshot()
+
+    assert git.file_at(snapshot, "src/clean.py") == "edited: int = 1\n"
+    assert git.file_at(snapshot, "src/legacy.py") == "also_edited: int = 2\n"
+
+
+def test_a_snapshot_keeps_what_a_sparse_checkout_leaves_out(git_repo: Repo) -> None:
+    """A skip-worktree file that is not on disk is not deleted: it is just not checked out."""
+    assert GIT is not None
+    git = backend(git_repo)
+    committed = git_repo.read("src/legacy.py")
+    run([GIT, "update-index", "--skip-worktree", "src/legacy.py"], cwd=git_repo.root)
+    (git_repo.root / "src" / "legacy.py").unlink()
+
+    snapshot = git.snapshot()
+
+    assert git.file_at(snapshot, "src/legacy.py") == committed

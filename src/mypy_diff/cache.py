@@ -24,6 +24,7 @@ import json
 import os
 import shutil
 import tempfile
+from collections.abc import Mapping
 from contextlib import ExitStack
 from pathlib import Path
 
@@ -114,8 +115,11 @@ class ResultCache:
         entry = self.load_entry(key)
         return None if entry is None else entry[0]
 
-    def load_entry(self, key: str) -> tuple[tuple[MypyMessage, ...], tuple[str, ...]] | None:
-        """The cached diagnostics, and the targets that run had to leave out (see run_mypy)."""
+    def load_entry(
+        self, key: str
+    ) -> tuple[tuple[MypyMessage, ...], tuple[str, ...], dict[str, str]] | None:
+        """The cached diagnostics, the targets that run had to leave out (see run_mypy), and
+        the text of the files it found them in when that is not the commit's (see --prepare)."""
         if not self.enabled:
             return None
         path = self._path(key)
@@ -126,14 +130,23 @@ class ResultCache:
         try:
             messages = tuple(MypyMessage.from_json(item) for item in raw["messages"])
             dropped = tuple(str(item) for item in raw.get("dropped", ()))
+            texts = raw.get("texts", {})
+            if not isinstance(texts, dict) or not all(
+                isinstance(name, str) and isinstance(text, str) for name, text in texts.items()
+            ):
+                raise ValueError("texts")
         except (KeyError, TypeError, ValueError, AttributeError):
             # A cache entry written by an incompatible version: ignore and re-run.
             return None
         _touch(path)
-        return messages, dropped
+        return messages, dropped, texts
 
     def store(
-        self, key: str, messages: tuple[MypyMessage, ...], dropped: tuple[str, ...] = ()
+        self,
+        key: str,
+        messages: tuple[MypyMessage, ...],
+        dropped: tuple[str, ...] = (),
+        texts: Mapping[str, str] | None = None,
     ) -> None:
         if not self.enabled:
             return
@@ -142,6 +155,7 @@ class ResultCache:
             "version": CACHE_VERSION,
             "messages": [m.to_json() for m in messages],
             "dropped": list(dropped),
+            "texts": dict(texts or {}),
         }
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
