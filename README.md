@@ -186,6 +186,40 @@ revision is checked out into a temporary worktree (`git worktree add`; for `mypy
 jj's git store, so nothing lands in the operation log) that is always removed afterwards, even if
 the run fails.
 
+### Pre-commit hooks
+
+`--staged` checks what the next commit will hold — git's index, not the working copy — and
+compares it with `HEAD`, so the question becomes "does this commit add errors?". Unstaged edits
+next to it play no part: an unstaged fix does not hide a staged error, and an unstaged mess does
+not block a clean commit. Inside a hook of `git commit -a` or `git commit <paths>` git hands the
+hook a temporary index; `--staged` reads that one.
+
+The index becomes a commit of its own (on no branch, with a fixed identity, so the same index on
+the same `HEAD` always gets the same id and the caches hit) and is checked in a temporary
+worktree. `-b` still picks another base; `--to` and `--staged` exclude each other. jj has no index,
+so `mypy-diff-jj --staged` is an error.
+
+A plain hook, `.git/hooks/pre-commit`:
+
+```sh
+#!/bin/sh
+exec mypy-diff --staged --no-progress
+```
+
+Or with [pre-commit](https://pre-commit.com):
+
+```yaml
+repos:
+  - repo: https://github.com/FolkiDevv/mypy-diff
+    rev: v0.2.0
+    hooks:
+      - id: mypy-diff
+        args: [--, src]   # what to check, if the mypy config does not say
+```
+
+pre-commit installs mypy-diff into an environment of its own; mypy still comes from your project
+(its `.venv`, `uv run`, or `mypy-cmd` in `[tool.mypy-diff]`), so that imports resolve.
+
 ### Baseline files
 
 Instead of a base revision, the comparison can be against a recorded list of errors:
@@ -217,6 +251,7 @@ line or has the same message somewhere in the same file, and the header says
   -b, --base REV         Base revision. Default: latest pushed named ancestor.
       --to REV           Target revision. Default: the working copy on disk.
       --tip              Use the tip of the -b branch instead of the fork point.
+      --staged           Check the staged changes against HEAD (git only).
       --format FMT       pretty | plain | json | github | sarif | gitlab   [pretty]
       --only WHAT        new | fixed | all                         [all]
       --show-unchanged / --no-show-unchanged
@@ -379,7 +414,7 @@ Severities map to SARIF levels `error`/`warning`/`note` and GitLab `major`/`mino
 | Key | |
 |---|---|
 | `schema_version` | `1`; bumped on any incompatible change |
-| `base`, `target` | `commit_id`, `short_id`, `change_id` (jj), `refs`, `description`, `working_copy`; the base also has `reason`, how it was chosen |
+| `base`, `target` | `commit_id`, `short_id`, `change_id` (jj), `refs`, `description`, `working_copy`, `staged`; the base also has `reason`, how it was chosen |
 | `summary` | counts: `new`, `fixed`, `changed`, `unchanged`, `net` — always all of them |
 | `new`, `fixed` | diagnostics: `path` (repository-relative), `line`, `column` (0-based, as mypy reports it), `severity`, `message`, `code`, `hint`, `notes` |
 | `changed` | pairs of `{"old": …, "new": …}` |

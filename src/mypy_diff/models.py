@@ -32,10 +32,14 @@ class RevisionInfo:
     is_working_copy: bool = False
     #: jj change id; empty for the git backend.
     change_id: str = ""
+    #: True when this is a commit mypy-diff made of git's index (``--staged``).
+    is_staged: bool = False
 
     def label(self) -> str:
         if self.is_working_copy:
             return "working copy (uncommitted)"
+        if self.is_staged:
+            return f"{self.short_id}  staged changes"
         parts = [self.change_id, self.short_id] if self.change_id else [self.short_id]
         if self.refs:
             parts.append(" ".join(self.refs))

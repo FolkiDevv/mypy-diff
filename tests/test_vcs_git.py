@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -123,6 +124,57 @@ def test_same_tree_sees_through_an_empty_commit(git_repo: Repo) -> None:
     git_repo.write("src/feature.py", "z: int = 3\n")
     commit(git_repo, "something")
     assert not git.same_tree(main, git.resolve("HEAD"))
+
+
+def test_staged_is_the_index_on_top_of_head(git_repo: Repo) -> None:
+    assert GIT is not None
+    git = backend(git_repo)
+    git_repo.write("src/staged.py", "x: int = 1\n")
+    run([GIT, "add", "src/staged.py"], cwd=git_repo.root)
+    git_repo.write("src/unstaged.py", "y: int = 2\n")
+
+    staged = git.staged()
+
+    assert staged.is_staged and not staged.is_working_copy
+    assert parents(git_repo, staged.commit_id) == {git.resolve("HEAD").commit_id}
+    assert git.file_at(staged, "src/staged.py") == "x: int = 1\n"
+    assert git.file_at(staged, "src/unstaged.py") is None
+    # Reproducible: the same index on the same HEAD is the same commit, so caches hit.
+    assert backend(git_repo).staged().commit_id == staged.commit_id
+
+
+def test_staged_reads_the_index_of_the_commit_being_made(
+    git_repo: Repo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """In a pre-commit hook of `git commit -a`, GIT_INDEX_FILE names a temporary index."""
+    assert GIT is not None
+    temporary = git_repo.root / ".git" / "next-index.lock"
+    env = {**os.environ, "GIT_INDEX_FILE": str(temporary)}
+    subprocess.run([GIT, "read-tree", "HEAD"], cwd=git_repo.root, env=env, check=True)
+    git_repo.write("src/hook.py", "z: int = 3\n")
+    subprocess.run([GIT, "add", "src/hook.py"], cwd=git_repo.root, env=env, check=True)
+    monkeypatch.setenv("GIT_INDEX_FILE", str(temporary))
+
+    staged = backend(git_repo).staged()
+
+    assert backend(git_repo).file_at(staged, "src/hook.py") == "z: int = 3\n"
+
+
+def test_staged_with_a_conflict_in_the_index_is_an_error(git_repo: Repo) -> None:
+    assert GIT is not None
+    git = backend(git_repo)
+
+    def feed(argv: list[str], text: str) -> str:
+        return subprocess.run(
+            argv, cwd=git_repo.root, input=text, capture_output=True, text=True, check=True
+        ).stdout
+
+    blob = feed([GIT, "hash-object", "-w", "--stdin"], "a\n").strip()
+    # Stage 1 ("common ancestor") of an unresolved merge conflict.
+    feed([GIT, "update-index", "--index-info"], f"100644 {blob} 1\tsrc/conflict.py\n")
+
+    with pytest.raises(MypyDiffError, match="Could not read the staged changes"):
+        git.staged()
 
 
 def test_file_at_reads_the_committed_content(git_repo: Repo) -> None:

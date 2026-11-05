@@ -96,6 +96,16 @@ def build_app(
             str | None, typer.Option("--base", "-b", help=backend_type.base_help)
         ] = None,
         to: Annotated[str | None, typer.Option("--to", help=backend_type.to_help)] = None,
+        staged: Annotated[
+            bool,
+            typer.Option(
+                "--staged",
+                help=(
+                    "Check what is staged for the next commit, not the working copy, and "
+                    "compare it with HEAD (git only). For pre-commit hooks."
+                ),
+            ),
+        ] = False,
         tip: Annotated[
             bool,
             typer.Option(
@@ -238,6 +248,7 @@ def build_app(
                 base=base,
                 to=to,
                 tip=tip,
+                staged=staged,
                 output_format=output_format,
                 only=only,
                 show_unchanged=show_unchanged,
@@ -306,8 +317,11 @@ def _run(
     parallel: bool | None = None,
     baseline: Path | None = None,
     record_baseline: Path | None = None,
+    staged: bool = False,
 ) -> int:
     check_mypy_args(mypy_args, prog=prog)
+    if staged and to is not None:
+        raise MypyDiffError("--staged and --to both choose the target.", "Use one or the other.")
     if baseline is not None and record_baseline is not None:
         raise MypyDiffError(
             "--baseline and --write-baseline exclude each other.",
@@ -383,7 +397,7 @@ def _run(
         activity.step("Resolving revisions")
         recorded: Baseline | None = None
         if record_baseline is not None:
-            target_rev = backend.working_copy() if to is None else backend.resolve(to)
+            target_rev = _resolve_target(backend, to, staged)
             activity.step(f"Checking {_describe(target_rev)}")
             run = checked(revision=target_rev, role="target", activity=activity)
             _refuse_missing_targets(run, target_rev)
@@ -405,7 +419,7 @@ def _run(
             return EXIT_OK
         if baseline is not None:
             recorded = read_baseline(baseline, prog)
-            target_rev = backend.working_copy() if to is None else backend.resolve(to)
+            target_rev = _resolve_target(backend, to, staged)
             base_rev = recorded.as_base()
             base_reason = f"baseline {baseline}"
             if recorded.revision.is_working_copy:
@@ -414,7 +428,7 @@ def _run(
                 errors.print(Text("warning: ", style="bold yellow") + Text(mismatch))
         else:
             base_rev, target_rev, base_reason = _resolve_revisions(
-                backend, base, to, tip, configured=settings.base
+                backend, base, to, tip, configured=settings.base, staged=staged
             )
         if verbose:
             _print_verbose_header(errors, backend, base_rev, target_rev, mypy, mypy_source, project)
@@ -608,6 +622,7 @@ def _resolve_revisions(
     to: str | None,
     tip: bool,
     configured: str | None = None,
+    staged: bool = False,
 ) -> tuple[RevisionInfo, RevisionInfo, str]:
     """The base, the target, and how the base was chosen.
 
@@ -616,9 +631,20 @@ def _resolve_revisions(
     request's own target beats the file because it is never wrong for that pull request — a
     PR into a release branch must not be compared with main.
 
+    With ``staged`` the question is what the commit being made adds, so the base is HEAD
+    unless ``-b`` names another.
+
     The target is resolved first: the base is always derived from it, never from HEAD/@.
     """
-    target = backend.working_copy() if to is None else backend.resolve(to)
+    target = _resolve_target(backend, to, staged)
+
+    if base is None and staged:
+        if tip:
+            raise MypyDiffError(
+                "--tip needs a branch: name it with -b, e.g. `-b main --tip`.",
+                "With --staged and no -b, the base is HEAD itself.",
+            )
+        return backend.resolve("HEAD"), target, "HEAD: what the commit adds"
 
     if base is None:
         ci_branch = _ci_target_branch()
@@ -643,6 +669,13 @@ def _resolve_revisions(
 
     resolved = backend.resolve_base(base, target, tip)
     return resolved, target, backend.base_reason
+
+
+def _resolve_target(backend: VcsBackend, to: str | None, staged: bool) -> RevisionInfo:
+    """The target: the staged changes, ``--to``, or the working copy on disk."""
+    if staged:
+        return backend.staged()
+    return backend.working_copy() if to is None else backend.resolve(to)
 
 
 def _first[T](*choices: T | None) -> T:
@@ -687,7 +720,11 @@ class _Checked:
 
 
 def _describe(revision: RevisionInfo) -> str:
-    return "the working copy" if revision.is_working_copy else f"revision {revision.short_id}"
+    if revision.is_working_copy:
+        return "the working copy"
+    if revision.is_staged:
+        return "the staged changes"
+    return f"revision {revision.short_id}"
 
 
 def _repo_paths(messages: Iterable[MypyMessage], project: Project) -> list[MypyMessage]:

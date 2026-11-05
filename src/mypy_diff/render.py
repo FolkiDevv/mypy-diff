@@ -233,6 +233,7 @@ def _revision_json(revision: Any) -> dict[str, Any]:
         "refs": list(revision.refs),
         "description": revision.description,
         "working_copy": revision.is_working_copy,
+        "staged": revision.is_staged,
     }
 
 

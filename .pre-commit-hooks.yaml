@@ -1,0 +1,9 @@
+# For https://pre-commit.com: fail a commit only when it adds mypy errors.
+- id: mypy-diff
+  name: mypy-diff
+  description: Check the staged changes with mypy and fail only on errors they add.
+  entry: mypy-diff --staged --no-progress
+  language: python
+  pass_filenames: false
+  require_serial: true
+  types_or: [python, pyi]

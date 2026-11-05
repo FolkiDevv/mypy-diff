@@ -1288,6 +1288,76 @@ def test_a_baseline_target_that_does_not_exist_is_an_error(
     assert "`nope` does not exist in the working copy" in result.stderr
 
 
+# ------------------------------------------------------------------ --staged
+
+
+def stage(repo: Repo, *paths: str) -> None:
+    assert GIT is not None
+    run([GIT, "add", *paths], cwd=repo.root)
+
+
+def test_staged_checks_the_index_not_the_working_copy(
+    git_repo: Repo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pre-commit hook must judge what is committed, not an unstaged fix next to it."""
+    monkeypatch.chdir(git_repo.root)
+    git_repo.write("src/clean.py", BROKEN_SOURCE)
+    stage(git_repo, "src/clean.py")
+    git_repo.write(
+        "src/clean.py", git_repo.read("src/clean.py").replace("return 42", "return name")
+    )
+
+    result = invoke(git_repo, "--staged", "--", "src")
+
+    assert result.exit_code == EXIT_NEW_ERRORS, result.output
+    assert "+ NEW (1)" in result.stdout
+    header = result.stdout.splitlines()
+    assert "(HEAD: what the commit adds)" in header[0]
+    assert "staged changes" in header[1]
+
+
+def test_staged_passes_an_unstaged_regression(
+    git_repo: Repo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(git_repo.root)
+    git_repo.write("src/legacy.py", "def broken() -> str:\n    return 'now correct'\n")
+    stage(git_repo, "src/legacy.py")
+    git_repo.write("src/clean.py", BROKEN_SOURCE)  # not staged: not part of the commit
+
+    result = invoke(git_repo, "--staged", "--", "src")
+
+    assert result.exit_code == EXIT_OK, result.output
+    assert "- FIXED (1)" in result.stdout
+    assert "NEW" not in result.stdout
+
+
+def test_staged_with_nothing_staged_runs_once(
+    git_repo: Repo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(git_repo.root)
+    git_repo.write("src/clean.py", BROKEN_SOURCE)  # not staged
+
+    result = invoke(git_repo, "--staged", "--", "src")
+
+    assert result.exit_code == EXIT_OK, result.output
+    assert "the same files as the base" in result.stderr
+
+
+def test_staged_and_to_exclude_each_other(git_repo: Repo, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(git_repo.root)
+    result = invoke(git_repo, "--staged", "--to", "HEAD", "--", "src")
+    assert result.exit_code == EXIT_FAILURE
+    assert "--staged and --to both choose the target" in result.stderr
+
+
+@pytest.mark.skipif(JJ is None, reason="jj is not installed")
+def test_staged_is_refused_by_jj(jj_repo: Repo, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(jj_repo.root)
+    result = invoke(jj_repo, "--staged", "--", "src")
+    assert result.exit_code == EXIT_FAILURE
+    assert "jj has none" in result.stderr
+
+
 # ------------------------------------------------------------------ mypy-diff
 
 

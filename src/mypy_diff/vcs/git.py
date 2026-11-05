@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -211,28 +212,62 @@ class GitBackend:
         if not tree:
             return None  # a conflict, or git < 2.38 without --write-tree
         tree = tree.splitlines()[0].strip()
-        identity = {
-            "GIT_AUTHOR_NAME": "mypy-diff",
-            "GIT_AUTHOR_EMAIL": "mypy-diff@localhost",
-            "GIT_AUTHOR_DATE": "@0 +0000",
-            "GIT_COMMITTER_NAME": "mypy-diff",
-            "GIT_COMMITTER_EMAIL": "mypy-diff@localhost",
-            "GIT_COMMITTER_DATE": "@0 +0000",
-        }
         message = "mypy-diff: merge of " + " and ".join(commit[:7] for commit in commits)
+        commit = self._synthetic_commit(tree, commits, message)
+        return None if commit is None else self._describe(commit)
+
+    def _synthetic_commit(self, tree: str, parents: list[str], message: str) -> str | None:
+        """A commit of ``tree`` that no branch points at, with a reproducible id.
+
+        Fixed author, committer and dates: the same tree on the same parents always gets the
+        same id, which the result cache and mypy's incremental cache key on. git's garbage
+        collection removes it eventually.
+        """
         completed = self._git.run(
             "commit-tree",
             "--no-gpg-sign",  # a signature would prompt, and its timestamp would change the id
             tree,
-            *(arg for c in commits for arg in ("-p", c)),
+            *(arg for parent in parents for arg in ("-p", parent)),
             "-m",
             message,
             check=False,
-            env=identity,
+            env=_SYNTHETIC_IDENTITY,
         )
         if completed.returncode != 0:
             return None
-        return self._describe(completed.stdout.strip())
+        return completed.stdout.strip()
+
+    def staged(self) -> RevisionInfo:
+        """What the next commit would hold: the index, as a commit on top of HEAD.
+
+        Inside a pre-commit hook git points GIT_INDEX_FILE at the index of the commit being
+        made — with `git commit -a` or `git commit <paths>`, a temporary one. Every other git
+        call here leaves that variable out (see `subprocess_env`); this one must read exactly
+        that index.
+        """
+        index = os.environ.get("GIT_INDEX_FILE")
+        completed = self._git.run(
+            "write-tree", check=False, env={"GIT_INDEX_FILE": index} if index else None
+        )
+        if completed.returncode != 0:
+            raise MypyDiffError(
+                "Could not read the staged changes.",
+                *(line for line in completed.stderr.strip().splitlines() if line.strip()),
+                "Resolve the conflicts in the index first (`git status` lists them).",
+            )
+        head = self._git.try_out("rev-parse", "-q", "--verify", "HEAD^{commit}")
+        if not head:
+            raise MypyDiffError(
+                "--staged compares the staged changes with HEAD, and there is no commit yet.",
+                "Make the first commit without the check, or pass a base with -b.",
+            )
+        tree = completed.stdout.strip()
+        commit = self._synthetic_commit(tree, [head], "mypy-diff: staged changes")
+        if commit is None:
+            raise MypyDiffError("Could not make a commit of the staged changes.")
+        return RevisionInfo(
+            commit_id=commit, short_id=commit[:8], description="staged changes", is_staged=True
+        )
 
     def is_shallow(self) -> bool:
         """Whether this is a shallow clone, which may lack the fork point."""
@@ -410,6 +445,17 @@ class GitBackend:
     def ignored_python_files(self, limit: int = 5) -> list[str]:
         """Python files in the working copy that git ignores: a clean checkout lacks them."""
         return _ignored_python_files(self._git, limit)
+
+
+#: Author and committer of the commits mypy-diff makes itself: fixed, so that their ids are too.
+_SYNTHETIC_IDENTITY = {
+    "GIT_AUTHOR_NAME": "mypy-diff",
+    "GIT_AUTHOR_EMAIL": "mypy-diff@localhost",
+    "GIT_AUTHOR_DATE": "@0 +0000",
+    "GIT_COMMITTER_NAME": "mypy-diff",
+    "GIT_COMMITTER_EMAIL": "mypy-diff@localhost",
+    "GIT_COMMITTER_DATE": "@0 +0000",
+}
 
 
 def _spellings_of(revspec: str) -> list[str]:

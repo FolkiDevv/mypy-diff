@@ -217,6 +217,14 @@ class JjBackend:
         )
         return completed.returncode == 0 and not completed.stdout.strip()
 
+    def staged(self) -> RevisionInfo:
+        """jj has no staging area: there is nothing between the working copy and a commit."""
+        raise MypyDiffError(
+            "--staged is for git's index; jj has none.",
+            "The working copy is already a commit: check it as it is, or split off the part "
+            "to check with `jj split` and pass it with --to.",
+        )
+
     def remote_branch(self, name: str) -> str:
         """How to name the remote copy of a branch, e.g. the CI's target branch."""
         return f'remote_bookmarks(exact:"{name}", exact:"origin")'
