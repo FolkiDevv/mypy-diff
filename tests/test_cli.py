@@ -1151,7 +1151,8 @@ def test_a_relative_config_mypy_command_works_from_a_subdirectory(
     result = runner.invoke(app, ["--doctor"], catch_exceptions=False)
 
     assert result.exit_code == EXIT_OK, result.output
-    assert f"({script})" in result.stdout
+    # Resolved: on macOS the temporary directory is a symlink (/var -> /private/var).
+    assert f"({script.resolve()})" in result.stdout
 
 
 def test_doctor_shows_the_targets_a_run_would_use(repo: Repo) -> None:
