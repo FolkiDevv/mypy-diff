@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import shutil
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -216,6 +217,10 @@ class JjBackend:
             check=False,
         )
         return completed.returncode == 0 and not completed.stdout.strip()
+
+    def snapshot(self) -> RevisionInfo:
+        """`@` itself: jj already made the working copy a commit, when it was snapshotted."""
+        return dataclasses.replace(self.working_copy(), is_working_copy=False, is_snapshot=True)
 
     def staged(self) -> RevisionInfo:
         """jj has no staging area: there is nothing between the working copy and a commit."""

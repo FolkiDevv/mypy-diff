@@ -65,7 +65,9 @@ def test_every_key_is_read(tmp_path: Path) -> None:
         'mypy-cmd = "uv run mypy"\n'
         "fail-on-changed = true\n"
         "parallel = false\n"
-        'args = ["src", "--strict"]\n',
+        'args = ["src", "--strict"]\n'
+        "isolated = true\n"
+        'prepare = "make proto"\n',
     )
 
     settings = load_settings(tmp_path, tmp_path)
@@ -80,8 +82,10 @@ def test_every_key_is_read(tmp_path: Path) -> None:
         fail_on_changed=True,
         parallel=False,
         args=("src", "--strict"),
+        isolated=True,
+        prepare="make proto",
     )
-    assert len(KNOWN_KEYS) == 8
+    assert len(KNOWN_KEYS) == 10
 
 
 def test_an_unknown_key_is_an_error(tmp_path: Path) -> None:

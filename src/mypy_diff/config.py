@@ -38,6 +38,8 @@ class Settings:
     parallel: bool | None = None
     #: mypy arguments to use when none are given after ``--``.
     args: tuple[str, ...] | None = None
+    isolated: bool | None = None
+    prepare: str | None = None
 
 
 def _string(key: str, value: object) -> str:
@@ -82,6 +84,8 @@ _KEYS: dict[str, tuple[str, Callable[[str, object], Any]]] = {
     "fail-on-changed": ("fail_on_changed", _boolean),
     "parallel": ("parallel", _boolean),
     "args": ("args", _strings),
+    "isolated": ("isolated", _boolean),
+    "prepare": ("prepare", _string),
 }
 
 KNOWN_KEYS = tuple(_KEYS)

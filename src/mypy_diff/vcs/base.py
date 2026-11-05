@@ -35,9 +35,14 @@ class CommandError(MypyDiffError):
 _HOOK_VARIABLES = ("GIT_INDEX_FILE",)
 
 
+def clean_environment() -> dict[str, str]:
+    """This process's environment without what git exports to hooks."""
+    return {key: value for key, value in os.environ.items() if key not in _HOOK_VARIABLES}
+
+
 def subprocess_env() -> dict[str, str]:
     """The environment for VCS subprocesses: machine-readable, locale-independent, hook-safe."""
-    env = {key: value for key, value in os.environ.items() if key not in _HOOK_VARIABLES}
+    env = clean_environment()
     env.update({"LC_ALL": "C", "NO_COLOR": "1"})
     return env
 
@@ -135,6 +140,13 @@ class VcsBackend(Protocol):
 
     def staged(self) -> RevisionInfo:
         """The staged changes, as a revision of their own (git's index; jj has none)."""
+        ...
+
+    def snapshot(self) -> RevisionInfo:
+        """The working copy as a commit, to check out like any other revision.
+
+        What a checkout of it holds is what the VCS tracks: ignored files are not in it.
+        """
         ...
 
     def same_tree(self, base: RevisionInfo, target: RevisionInfo) -> bool:

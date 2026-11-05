@@ -15,6 +15,7 @@ import hashlib
 import os
 import re
 import shutil
+import subprocess
 import sys
 import traceback
 from collections.abc import Iterable
@@ -53,6 +54,7 @@ from .progress import Activity
 from .project import Project, configured_targets, find_project, mypy_config_file
 from .render import Only, OutputFormat, make_console, render, step_summary, summary_text
 from .vcs import GitBackend, JjBackend, VcsBackend
+from .vcs.base import clean_environment
 
 EXIT_OK = 0
 EXIT_NEW_ERRORS = 1
@@ -96,6 +98,26 @@ def build_app(
             str | None, typer.Option("--base", "-b", help=backend_type.base_help)
         ] = None,
         to: Annotated[str | None, typer.Option("--to", help=backend_type.to_help)] = None,
+        isolated: Annotated[
+            bool | None,
+            typer.Option(
+                "--isolated/--no-isolated",
+                help=(
+                    "Check the working copy in a clean checkout, like the base, instead of in "
+                    "place: files the VCS ignores are left out on both sides."
+                ),
+            ),
+        ] = None,
+        prepare: Annotated[
+            str | None,
+            typer.Option(
+                "--prepare",
+                help=(
+                    "Shell command to run in every checkout before mypy, e.g. 'make proto' to "
+                    "generate the code a clean checkout lacks."
+                ),
+            ),
+        ] = None,
         staged: Annotated[
             bool,
             typer.Option(
@@ -249,6 +271,8 @@ def build_app(
                 to=to,
                 tip=tip,
                 staged=staged,
+                isolated=isolated,
+                prepare=prepare,
                 output_format=output_format,
                 only=only,
                 show_unchanged=show_unchanged,
@@ -318,6 +342,8 @@ def _run(
     baseline: Path | None = None,
     record_baseline: Path | None = None,
     staged: bool = False,
+    isolated: bool | None = None,
+    prepare: str | None = None,
 ) -> int:
     check_mypy_args(mypy_args, prog=prog)
     if staged and to is not None:
@@ -346,6 +372,8 @@ def _run(
         show_unchanged = _first(show_unchanged, settings.show_unchanged, False)
         fail_on_changed = _first(fail_on_changed, settings.fail_on_changed, False)
         parallel = parallel if parallel is not None else settings.parallel
+        isolated = _first(isolated, settings.isolated, False)
+        prepare = prepare if prepare is not None else settings.prepare
         args_from_settings = not mypy_args and bool(settings.args)
         if args_from_settings and settings.args:
             mypy_args = settings.args
@@ -392,12 +420,13 @@ def _run(
             console=errors,
             verbose=verbose,
             location=where,
+            prepare=prepare,
         )
 
         activity.step("Resolving revisions")
         recorded: Baseline | None = None
         if record_baseline is not None:
-            target_rev = _resolve_target(backend, to, staged)
+            target_rev = _resolve_target(backend, to, staged, isolated)
             # Which revision is recorded matters: say so when `--to` matched several.
             for warning in backend.warnings:
                 errors.print(Text("warning: ", style="bold yellow") + Text(warning))
@@ -422,7 +451,7 @@ def _run(
             return EXIT_OK
         if baseline is not None:
             recorded = read_baseline(baseline, prog)
-            target_rev = _resolve_target(backend, to, staged)
+            target_rev = _resolve_target(backend, to, staged, isolated)
             base_rev = recorded.as_base()
             base_reason = f"baseline {baseline}"
             if recorded.revision.is_working_copy:
@@ -431,7 +460,13 @@ def _run(
                 errors.print(Text("warning: ", style="bold yellow") + Text(mismatch))
         else:
             base_rev, target_rev, base_reason = _resolve_revisions(
-                backend, base, to, tip, configured=settings.base, staged=staged
+                backend,
+                base,
+                to,
+                tip,
+                configured=settings.base,
+                staged=staged,
+                isolated=isolated,
             )
         if verbose:
             _print_verbose_header(errors, backend, base_rev, target_rev, mypy, mypy_source, project)
@@ -626,6 +661,7 @@ def _resolve_revisions(
     tip: bool,
     configured: str | None = None,
     staged: bool = False,
+    isolated: bool = False,
 ) -> tuple[RevisionInfo, RevisionInfo, str]:
     """The base, the target, and how the base was chosen.
 
@@ -639,7 +675,7 @@ def _resolve_revisions(
 
     The target is resolved first: the base is always derived from it, never from HEAD/@.
     """
-    target = _resolve_target(backend, to, staged)
+    target = _resolve_target(backend, to, staged, isolated)
 
     if base is None and staged:
         if tip:
@@ -674,11 +710,17 @@ def _resolve_revisions(
     return resolved, target, backend.base_reason
 
 
-def _resolve_target(backend: VcsBackend, to: str | None, staged: bool) -> RevisionInfo:
-    """The target: the staged changes, ``--to``, or the working copy on disk."""
+def _resolve_target(
+    backend: VcsBackend, to: str | None, staged: bool, isolated: bool = False
+) -> RevisionInfo:
+    """The target: the staged changes, ``--to``, or the working copy — on disk, or with
+    ``isolated`` as a commit checked out like the base. ``isolated`` changes nothing for a
+    target that is checked out anyway."""
     if staged:
         return backend.staged()
-    return backend.working_copy() if to is None else backend.resolve(to)
+    if to is not None:
+        return backend.resolve(to)
+    return backend.snapshot() if isolated else backend.working_copy()
 
 
 def _first[T](*choices: T | None) -> T:
@@ -727,6 +769,8 @@ def _describe(revision: RevisionInfo) -> str:
         return "the working copy"
     if revision.is_staged:
         return "the staged changes"
+    if revision.is_snapshot:
+        return "the working copy (checked out)"
     return f"revision {revision.short_id}"
 
 
@@ -808,7 +852,8 @@ def _asymmetry_warning(backend: VcsBackend, result: DiffResult, project: Project
         f"{count} import {'error exists' if count == 1 else 'errors exist'} only in the base"
         f"{named}, on import lines your change kept. The base is checked in a clean checkout, "
         f"without {' and '.join(missing)}. Errors in code that uses those modules may be "
-        "reported as NEW."
+        "reported as NEW. To check both sides alike, pass --isolated, and --prepare with the "
+        "command that generates them."
     )
 
 
@@ -888,8 +933,13 @@ def _messages_for(
     activity: Activity,
     role: str,
     location: str,
+    prepare: str | None = None,
 ) -> _Checked:
-    """Run mypy for one revision, using the cache when the revision is immutable."""
+    """Run mypy for one revision, using the cache when the revision is immutable.
+
+    ``prepare`` runs in the checkout first. It changes what mypy sees, so it is part of the
+    cache key; the working copy, checked in place, is never touched by it.
+    """
     what = "working copy" if revision.is_working_copy else revision.short_id
     activity.step(f"Checking {what}")
 
@@ -905,7 +955,9 @@ def _messages_for(
             mypy.display_version,
             mypy_args,
             project.subdir,
-            fingerprint + _outside_config_digest(mypy_args, backend, revision, project),
+            fingerprint
+            + _outside_config_digest(mypy_args, backend, revision, project)
+            + (f"\0prepare\0{prepare}" if prepare else ""),
         )
         cached = cache.load_entry(cache_key)
         if cached is not None:
@@ -937,6 +989,11 @@ def _messages_for(
                 run_env = checkout_environment(import_dirs, project.root, checkout)
                 if verbose and import_dirs:
                     _trace(console, f"importing {', '.join(import_dirs)} from the checkout")
+            if prepare:
+                activity.detail(f"Preparing {what}")
+                if verbose:
+                    _trace(console, f"$ {prepare}  (in {workdir})")
+                _run_prepare(prepare, workdir, run_env, revision)
 
         activity.detail(f"Running mypy on {what}")
 
@@ -981,6 +1038,32 @@ def _messages_for(
     if cache_key is not None:
         cache.store(cache_key, messages, dropped)
     return _Checked(messages, dropped)
+
+
+def _run_prepare(command: str, workdir: Path, env: dict[str, str], revision: RevisionInfo) -> None:
+    """Run the user's --prepare command in a checkout; a failure ends the run.
+
+    Through the shell, as typed. The environment is the user's own (minus what git exports to
+    hooks), plus the import paths that point at the checkout.
+    """
+    completed = subprocess.run(
+        command,
+        shell=True,
+        cwd=workdir,
+        env={**clean_environment(), **env},
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    if completed.returncode != 0:
+        output = [line for line in (completed.stdout + completed.stderr).splitlines() if line]
+        raise MypyDiffError(
+            f"--prepare failed in {_describe(revision)} with exit code {completed.returncode}: "
+            f"{command}",
+            *output[-10:],
+        )
 
 
 def _diff(

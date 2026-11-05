@@ -1043,6 +1043,7 @@ def test_a_generated_module_the_base_lacks_is_pointed_out(
 
     assert "import error exists only in the base" in result.output
     assert "src/gen_pb2.py" in result.output
+    assert "pass --isolated" in result.output
 
 
 # ------------------------------------------------------------------ changed errors
@@ -1367,6 +1368,89 @@ def test_staged_is_refused_by_jj(jj_repo: Repo, monkeypatch: pytest.MonkeyPatch)
     result = invoke(jj_repo, "--staged", "--", "src")
     assert result.exit_code == EXIT_FAILURE
     assert "jj has none" in result.stderr
+
+
+# ------------------------------------------------------------------ --isolated, --prepare
+
+
+def test_isolated_checks_the_working_copy_like_the_base(repo: Repo) -> None:
+    """Checked out, the working copy keeps its changes, untracked files included."""
+    repo.write("src/brand_new.py", BROKEN_SOURCE)
+
+    result = invoke(repo, "--isolated", "--", "src")
+
+    assert result.exit_code == EXIT_NEW_ERRORS, result.output
+    assert "src/brand_new.py:6" in result.stdout
+    assert "checked out on its own" in result.stdout.splitlines()[1]
+
+
+def test_isolated_leaves_ignored_files_out_on_both_sides(
+    git_repo: Repo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The asymmetry the default mode warns about: a file only the working copy has."""
+    monkeypatch.chdir(git_repo.root)
+    (git_repo.root / ".git" / "info" / "exclude").write_text("generated.py\n", encoding="utf-8")
+    git_repo.write("src/generated.py", BROKEN_SOURCE)
+
+    in_place = invoke(git_repo, "--", "src")
+    isolated = invoke(git_repo, "--isolated", "--", "src")
+
+    assert in_place.exit_code == EXIT_NEW_ERRORS, in_place.output
+    assert isolated.exit_code == EXIT_OK, isolated.output
+    assert "generated.py" not in isolated.stdout
+
+
+def write_generator(directory: Path, content: str) -> str:
+    """A --prepare command that writes src/generated.py in the directory it runs in."""
+    script = directory / "generate.py"
+    script.write_text(
+        "from pathlib import Path\n"
+        f"Path('src', 'generated.py').write_text({content!r}, encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    return f'"{sys.executable}" "{script}"'
+
+
+def test_prepare_runs_in_both_checkouts(repo: Repo, short_tmp_path: Path) -> None:
+    """Generated code exists on both sides, so its error is pre-existing, not new."""
+    command = write_generator(short_tmp_path, 'value: int = "generated"\n')
+    repo.write("src/clean.py", repo.read("src/clean.py") + "\n# touched\n")
+
+    result = invoke(repo, "--isolated", "--prepare", command, "--", "src")
+
+    assert result.exit_code == EXIT_OK, result.output
+    assert "2 unchanged errors in 2 files" in result.stdout
+    # The working copy itself is never touched.
+    assert not (repo.root / "src" / "generated.py").exists()
+
+
+def test_a_different_prepare_command_is_not_served_from_the_cache(
+    repo: Repo, short_tmp_path: Path
+) -> None:
+    cache = short_tmp_path / "cache"
+    repo.write("src/clean.py", repo.read("src/clean.py") + "\n# touched\n")
+    (short_tmp_path / "a").mkdir()
+    (short_tmp_path / "b").mkdir()
+    broken = write_generator(short_tmp_path / "a", 'value: int = "generated"\n')
+    fine = write_generator(short_tmp_path / "b", "value: int = 1\n")
+
+    first = invoke(repo, "--isolated", "--prepare", broken, "--", "src", cache=cache)
+    second = invoke(repo, "--isolated", "--prepare", fine, "--", "src", cache=cache)
+
+    assert "2 unchanged errors" in first.stdout, first.output
+    assert "1 unchanged error " in second.stdout, second.output
+
+
+def test_a_failing_prepare_command_fails_the_run(repo: Repo) -> None:
+    command = f'"{sys.executable}" -c "import sys; print(\'boom\'); sys.exit(3)"'
+    repo.write("src/clean.py", repo.read("src/clean.py") + "\n# touched\n")
+
+    result = invoke(repo, "--isolated", "--prepare", command, "--", "src")
+
+    assert result.exit_code == EXIT_FAILURE
+    assert "--prepare failed" in result.stderr
+    assert "exit code 3" in result.stderr
+    assert "boom" in result.stderr
 
 
 # ------------------------------------------------------------------ mypy-diff

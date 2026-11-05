@@ -186,6 +186,31 @@ revision is checked out into a temporary worktree (`git worktree add`; for `mypy
 jj's git store, so nothing lands in the operation log) that is always removed afterwards, even if
 the run fails.
 
+### Clean checkouts on both sides: `--isolated` and `--prepare`
+
+By default the working copy is checked where it is, and only the base in a clean checkout. That is
+fast, and it is what you see — but the two sides do not see the same files. What git ignores is on
+disk but in no checkout: generated code (`*_pb2.py`, `_version.py`), a local settings module. The
+base cannot import it, and the comparison is lopsided; mypy-diff warns when the results look like
+it.
+
+`--isolated` removes the difference: the working copy — tracked and untracked files as they are on
+disk, deletions included, ignored files not — becomes a commit of its own and is checked out like
+the base. Your staging area is not touched. With jj, that commit is simply `@`. The cost is a second
+checkout, and the two runs no longer happen side by side.
+
+`--prepare CMD` runs a shell command in every checkout before mypy does, in the project directory:
+the step that recreates what a clean checkout lacks.
+
+```bash
+mypy-diff --isolated --prepare "make proto" -- src
+```
+
+The command runs with your environment, and its output is shown only when it fails (which ends the
+run with exit code `2`). It never runs in the working copy itself. It is part of the result cache
+key: another command means another result. Both options can live in `[tool.mypy-diff]`:
+`isolated = true`, `prepare = "make proto"`.
+
 ### Pre-commit hooks
 
 `--staged` checks what the next commit will hold — git's index, not the working copy — and
@@ -252,6 +277,9 @@ line or has the same message somewhere in the same file, and the header says
       --to REV           Target revision. Default: the working copy on disk.
       --tip              Use the tip of the -b branch instead of the fork point.
       --staged           Check the staged changes against HEAD (git only).
+      --isolated / --no-isolated
+                         Check the working copy in a clean checkout, like the base.
+      --prepare CMD      Run CMD in every checkout before mypy, e.g. 'make proto'.
       --format FMT       pretty | plain | json | github | sarif | gitlab   [pretty]
       --only WHAT        new | fixed | all                         [all]
       --show-unchanged / --no-show-unchanged
@@ -292,6 +320,8 @@ only = "all"                  # all | new | fixed
 show-unchanged = false
 fail-on-changed = false
 parallel = true               # unset: with 4+ CPUs
+isolated = false              # check the working copy in a clean checkout too
+prepare = "make proto"        # run in every checkout before mypy
 ```
 
 Keys are spelt like the long options. The table is looked for in the project directory and in
@@ -414,7 +444,7 @@ Severities map to SARIF levels `error`/`warning`/`note` and GitLab `major`/`mino
 | Key | |
 |---|---|
 | `schema_version` | `1`; bumped on any incompatible change |
-| `base`, `target` | `commit_id`, `short_id`, `change_id` (jj), `refs`, `description`, `working_copy`, `staged`; the base also has `reason`, how it was chosen |
+| `base`, `target` | `commit_id`, `short_id`, `change_id` (jj), `refs`, `description`, `working_copy`, `staged`, `snapshot` (`--isolated`); the base also has `reason`, how it was chosen |
 | `summary` | counts: `new`, `fixed`, `changed`, `unchanged`, `net` — always all of them |
 | `new`, `fixed` | diagnostics: `path` (repository-relative), `line`, `column` (0-based, as mypy reports it), `severity`, `message`, `code`, `hint`, `notes` |
 | `changed` | pairs of `{"old": …, "new": …}` |

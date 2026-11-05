@@ -177,6 +177,29 @@ def test_staged_with_a_conflict_in_the_index_is_an_error(git_repo: Repo) -> None
         git.staged()
 
 
+def test_snapshot_is_the_working_copy_without_ignored_files(git_repo: Repo) -> None:
+    assert GIT is not None
+    git = backend(git_repo)
+    (git_repo.root / ".git" / "info" / "exclude").write_text("ignored.py\n", encoding="utf-8")
+    git_repo.write("src/clean.py", "edited: int = 1\n")
+    git_repo.write("src/untracked.py", "new: int = 2\n")
+    git_repo.write("src/ignored.py", "secret: int = 3\n")
+    (git_repo.root / "src" / "legacy.py").unlink()
+    index_before = run([GIT, "ls-files", "--stage"], cwd=git_repo.root).stdout
+
+    snapshot = git.snapshot()
+
+    assert snapshot.is_snapshot and not snapshot.is_working_copy
+    assert parents(git_repo, snapshot.commit_id) == {git.resolve("HEAD").commit_id}
+    assert git.file_at(snapshot, "src/clean.py") == "edited: int = 1\n"
+    assert git.file_at(snapshot, "src/untracked.py") == "new: int = 2\n"
+    assert git.file_at(snapshot, "src/ignored.py") is None
+    assert git.file_at(snapshot, "src/legacy.py") is None
+    # The user's staging is left exactly as it was.
+    assert run([GIT, "ls-files", "--stage"], cwd=git_repo.root).stdout == index_before
+    assert backend(git_repo).snapshot().commit_id == snapshot.commit_id
+
+
 def test_file_at_reads_the_committed_content(git_repo: Repo) -> None:
     git = backend(git_repo)
     head = git.resolve("HEAD")

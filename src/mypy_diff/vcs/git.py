@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -290,6 +291,39 @@ class GitBackend:
             for rev in (base, target)
         ]
         return trees[0] is not None and trees[0] == trees[1]
+
+    def snapshot(self) -> RevisionInfo:
+        """The working copy as a commit on top of HEAD: tracked and untracked files as they are
+        on disk, deletions included, ignored files not.
+
+        Built in an index of its own, a copy of the real one so unchanged files need not be hashed
+        again; the repository's index, the user's staging, is never touched.
+        """
+        head = self._git.try_out("rev-parse", "-q", "--verify", "HEAD^{commit}")
+        if not head:
+            raise MypyDiffError(
+                "--isolated checks the working copy on top of HEAD, and there is no commit yet."
+            )
+        with tempfile.TemporaryDirectory(prefix="mypy-diff-index-") as scratch:
+            index = Path(scratch) / "index"
+            current = self._git.try_out("rev-parse", "--git-path", "index")
+            source = self.root() / current if current else None
+            env = {"GIT_INDEX_FILE": str(index)}
+            if source is not None and source.is_file():
+                shutil.copyfile(source, index)
+            else:
+                self._git.run("read-tree", head, env=env)
+            self._git.run("add", "--all", "--", ".", env=env)
+            tree = self._git.run("write-tree", env=env).stdout.strip()
+        commit = self._synthetic_commit(tree, [head], "mypy-diff: working copy")
+        if commit is None:
+            raise MypyDiffError("Could not make a commit of the working copy.")
+        return RevisionInfo(
+            commit_id=commit,
+            short_id=commit[:8],
+            description="working copy",
+            is_snapshot=True,
+        )
 
     def remote_branch(self, name: str) -> str:
         """How to name the remote-tracking copy of a branch, e.g. the CI's target branch."""
