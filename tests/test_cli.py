@@ -1191,6 +1191,102 @@ def test_on_a_pull_request_its_target_beats_the_configured_base(
     assert "GITHUB_BASE_REF" in result.stdout.splitlines()[0]
 
 
+# ------------------------------------------------------------------ baseline files
+
+
+def test_a_baseline_of_an_unchanged_tree_reports_no_change(
+    repo: Repo, short_tmp_path: Path
+) -> None:
+    baseline = short_tmp_path / "baseline.json"
+
+    written = invoke(repo, "--write-baseline", str(baseline), "--", "src")
+    assert written.exit_code == EXIT_OK, written.output
+    assert "Recorded 1 error" in written.stderr
+    recorded = json.loads(baseline.read_text(encoding="utf-8"))
+    assert [m["path"] for m in recorded["messages"]] == ["src/legacy.py"]
+
+    compared = invoke(repo, "--baseline", str(baseline), "--", "src")
+    assert compared.exit_code == EXIT_OK, compared.output
+    assert "No change in mypy errors." in compared.stdout
+    assert f"baseline {baseline}" in compared.stdout.splitlines()[0]
+
+
+def test_a_new_error_against_a_baseline_fails(repo: Repo, short_tmp_path: Path) -> None:
+    baseline = short_tmp_path / "baseline.json"
+    invoke(repo, "--write-baseline", str(baseline), "--", "src")
+    repo.write("src/clean.py", BROKEN_SOURCE)
+    # Lines added above the recorded error: it must still be matched.
+    repo.write("src/legacy.py", "import os\n\n\n" + repo.read("src/legacy.py"))
+
+    result = invoke(repo, "--baseline", str(baseline), "--", "src")
+
+    assert result.exit_code == EXIT_NEW_ERRORS, result.output
+    assert "+ NEW (1)" in result.stdout
+    assert "src/clean.py:6" in result.stdout
+    assert "1 unchanged error" in result.stdout
+
+
+def test_a_baseline_of_a_commit_follows_reworded_errors(repo: Repo, short_tmp_path: Path) -> None:
+    """Recorded from a clean tree, the baseline knows its files: CHANGED works as against -b."""
+    baseline = short_tmp_path / "baseline.json"
+    invoke(repo, "--write-baseline", str(baseline), "--", "src")
+    repo.write("src/legacy.py", 'def broken() -> float:\n    return "already wrong"\n')
+
+    result = invoke(repo, "--baseline", str(baseline), "--", "src")
+
+    assert result.exit_code == EXIT_OK, result.output
+    assert "~ CHANGED (1)" in result.stdout
+
+
+def test_a_baseline_of_uncommitted_changes_says_so(repo: Repo, short_tmp_path: Path) -> None:
+    if repo.vcs == "jj":
+        pytest.skip("jj snapshots the working copy: a baseline of it is a commit")
+    baseline = short_tmp_path / "baseline.json"
+    repo.write("src/extra.py", "x: int = 1\n")
+    invoke(repo, "--write-baseline", str(baseline), "--", "src")
+
+    result = invoke(repo, "--baseline", str(baseline), "--", "src")
+
+    assert result.exit_code == EXIT_OK, result.output
+    assert "recorded from uncommitted changes" in result.stdout.splitlines()[0]
+
+
+def test_a_baseline_from_another_mypy_warns(repo: Repo, short_tmp_path: Path) -> None:
+    baseline = short_tmp_path / "baseline.json"
+    invoke(repo, "--write-baseline", str(baseline), "--", "src")
+    recorded = json.loads(baseline.read_text(encoding="utf-8"))
+    recorded["mypy_version"] = "mypy 0.1"
+    baseline.write_text(json.dumps(recorded), encoding="utf-8")
+
+    result = invoke(repo, "--baseline", str(baseline), "--", "src")
+
+    assert result.exit_code == EXIT_OK, result.output
+    assert "was written with mypy 0.1" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("args", "expected"),
+    [
+        (["--baseline", "b.json", "-b", "main"], "a baseline file takes its place"),
+        (["--write-baseline", "b.json", "--tip"], "a baseline file takes its place"),
+        (["--baseline", "a.json", "--write-baseline", "b.json"], "exclude each other"),
+        (["--baseline", "missing.json"], "No baseline at missing.json"),
+    ],
+)
+def test_baseline_misuse_is_an_error(repo: Repo, args: list[str], expected: str) -> None:
+    result = invoke(repo, *args, "--", "src")
+    assert result.exit_code == EXIT_FAILURE
+    assert expected in result.stderr
+
+
+def test_a_baseline_target_that_does_not_exist_is_an_error(
+    repo: Repo, short_tmp_path: Path
+) -> None:
+    result = invoke(repo, "--write-baseline", str(short_tmp_path / "b.json"), "--", "nope")
+    assert result.exit_code == EXIT_FAILURE
+    assert "`nope` does not exist in the working copy" in result.stderr
+
+
 # ------------------------------------------------------------------ mypy-diff
 
 

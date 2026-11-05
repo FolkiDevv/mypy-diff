@@ -28,6 +28,7 @@ from rich.console import Console
 from rich.text import Text
 
 from . import MypyDiffError, __version__
+from .baseline import Baseline, read_baseline, write_baseline
 from .cache import ResultCache
 from .cache import location as cache_location
 from .config import Settings, load_settings
@@ -178,6 +179,23 @@ def build_app(
                 ),
             ),
         ] = None,
+        baseline: Annotated[
+            Path | None,
+            typer.Option(
+                "--baseline",
+                help=(
+                    "Compare the target with the errors recorded in this file "
+                    "(see --write-baseline) instead of with a base revision."
+                ),
+            ),
+        ] = None,
+        record_baseline: Annotated[
+            Path | None,
+            typer.Option(
+                "--write-baseline",
+                help="Check the target, record its errors in this file, then exit.",
+            ),
+        ] = None,
         skip_version_check: Annotated[
             bool, typer.Option("--skip-version-check", help="Do not enforce minimum tool versions.")
         ] = False,
@@ -232,6 +250,8 @@ def build_app(
                 verbose=verbose,
                 fail_on_changed=fail_on_changed,
                 parallel=parallel,
+                baseline=baseline,
+                record_baseline=record_baseline,
             )
         except MypyDiffError as failure:
             # Text(), not markup strings: messages quote mypy output and config snippets, and
@@ -284,8 +304,20 @@ def _run(
     verbose: bool,
     fail_on_changed: bool | None = None,
     parallel: bool | None = None,
+    baseline: Path | None = None,
+    record_baseline: Path | None = None,
 ) -> int:
     check_mypy_args(mypy_args, prog=prog)
+    if baseline is not None and record_baseline is not None:
+        raise MypyDiffError(
+            "--baseline and --write-baseline exclude each other.",
+            "Record the baseline in one run, compare against it in the next.",
+        )
+    if (baseline is not None or record_baseline is not None) and (base is not None or tip):
+        raise MypyDiffError(
+            "-b and --tip pick a base revision; a baseline file takes its place.",
+            "Use one or the other.",
+        )
 
     with activity:
         activity.step("Checking tools")
@@ -331,17 +363,6 @@ def _run(
             )
             return EXIT_OK
 
-        activity.step("Resolving revisions")
-        base_rev, target_rev, base_reason = _resolve_revisions(
-            backend, base, to, tip, configured=settings.base
-        )
-        if verbose:
-            _print_verbose_header(errors, backend, base_rev, target_rev, mypy, mypy_source, project)
-            if settings.path is not None:
-                _trace(errors, f"config {settings.path}")
-        for warning in backend.warnings:
-            errors.print(Text("warning: ", style="bold yellow") + Text(warning))
-
         cache = ResultCache(cache_dir, enabled=not no_cache)
         environment = _EnvironmentProbe(mypy, project.directory)
         where = cache_location(project.root, project.subdir)
@@ -359,6 +380,49 @@ def _run(
             location=where,
         )
 
+        activity.step("Resolving revisions")
+        recorded: Baseline | None = None
+        if record_baseline is not None:
+            target_rev = backend.working_copy() if to is None else backend.resolve(to)
+            activity.step(f"Checking {_describe(target_rev)}")
+            run = checked(revision=target_rev, role="target", activity=activity)
+            _refuse_missing_targets(run, target_rev)
+            count = write_baseline(
+                record_baseline,
+                run.messages,
+                _as_recorded(backend, target_rev),
+                mypy.display_version,
+                mypy_args,
+                project.subdir,
+            )
+            errors.print(
+                Text(
+                    f"Recorded {count} {'error' if count == 1 else 'errors'} of "
+                    f"{_describe(target_rev)} in {record_baseline}."
+                )
+            )
+            cache.prune()
+            return EXIT_OK
+        if baseline is not None:
+            recorded = read_baseline(baseline, prog)
+            target_rev = backend.working_copy() if to is None else backend.resolve(to)
+            base_rev = recorded.as_base()
+            base_reason = f"baseline {baseline}"
+            if recorded.revision.is_working_copy:
+                base_reason += ", recorded from uncommitted changes"
+            for mismatch in recorded.mismatches(mypy.display_version, mypy_args, project.subdir):
+                errors.print(Text("warning: ", style="bold yellow") + Text(mismatch))
+        else:
+            base_rev, target_rev, base_reason = _resolve_revisions(
+                backend, base, to, tip, configured=settings.base
+            )
+        if verbose:
+            _print_verbose_header(errors, backend, base_rev, target_rev, mypy, mypy_source, project)
+            if settings.path is not None:
+                _trace(errors, f"config {settings.path}")
+        for warning in backend.warnings:
+            errors.print(Text("warning: ", style="bold yellow") + Text(warning))
+
         def check_base(progress: Activity) -> _Checked:
             try:
                 return checked(revision=base_rev, role="base", activity=progress)
@@ -375,9 +439,14 @@ def _run(
         def check_target(progress: Activity) -> _Checked:
             return checked(revision=target_rev, role="target", activity=progress)
 
-        identical = _same_tree(backend, base_rev, target_rev)
         try:
-            if identical:
+            if recorded is not None:
+                # The base is the record: only the target runs.
+                activity.step(f"Checking {_describe(target_rev)}")
+                target_run = check_target(activity)
+                _refuse_missing_targets(target_run, target_rev)
+                base_run = _Checked(recorded.messages)
+            elif _same_tree(backend, base_rev, target_rev):
                 # Nothing differs between the two: check once, and compare that with itself.
                 errors.print(
                     Text("warning: ", style="bold yellow")
@@ -421,11 +490,18 @@ def _run(
             _check_targets_exist(base_run, target_run, base_rev, target_rev)
             activity.step("Comparing results")
             result = _diff(
-                backend, base_rev, target_rev, base_run.messages, target_run.messages, project
+                backend,
+                base_rev,
+                target_rev,
+                base_run.messages,
+                target_run.messages,
+                project,
+                base_text=recorded is None or recorded.has_file_contents,
             )
 
     result = dataclasses.replace(result, base_reason=base_reason)
-    if target_rev.is_working_copy:
+    # A baseline recorded from a working copy saw the same ignored files this run sees.
+    if target_rev.is_working_copy and recorded is None:
         hint = _asymmetry_warning(backend, result, project)
         if hint:
             errors.print(Text("warning: ", style="bold yellow") + Text(hint))
@@ -620,6 +696,24 @@ def _repo_paths(messages: Iterable[MypyMessage], project: Project) -> list[MypyM
     return [
         dataclasses.replace(message, path=project.repo_path(message.path)) for message in messages
     ]
+
+
+def _refuse_missing_targets(run: _Checked, revision: RevisionInfo) -> None:
+    """With a single run, a target missing from it is a typo, not a file that was added."""
+    if run.dropped_targets:
+        raise MypyDiffError(
+            f"`{run.dropped_targets[0]}` does not exist in {_describe(revision)}.",
+            "Paths after `--` are relative to the project directory, as they are for mypy.",
+        )
+
+
+def _as_recorded(backend: VcsBackend, revision: RevisionInfo) -> RevisionInfo:
+    """The revision a baseline records. A working copy without uncommitted changes is its
+    commit, whose files a later comparison can read; with changes, only the files on disk now
+    match the errors."""
+    if revision.is_working_copy and not backend.has_uncommitted_changes():
+        return dataclasses.replace(revision, is_working_copy=False)
+    return revision
 
 
 def _check_targets_exist(
@@ -856,12 +950,20 @@ def _diff(
     base_messages: tuple[MypyMessage, ...],
     target_messages: tuple[MypyMessage, ...],
     project: Project,
+    base_text: bool = True,
 ) -> DiffResult:
-    """Diff the two message sets, reading file contents lazily for the line-shift tier."""
+    """Diff the two message sets, reading file contents lazily for the line-shift tier.
+
+    Without ``base_text`` the base's files are unknown (a baseline recorded from uncommitted
+    changes): the tiers that follow a line through an edit are skipped, rather than fed the text
+    of a commit the errors were not found in.
+    """
     base_cache: dict[str, str | None] = {}
     target_cache: dict[str, str | None] = {}
 
     def read_base(path: str) -> str | None:
+        if not base_text:
+            return None
         if path not in base_cache:
             base_cache[path] = backend.file_at(base_rev, path)
         return base_cache[path]

@@ -186,6 +186,31 @@ revision is checked out into a temporary worktree (`git worktree add`; for `mypy
 jj's git store, so nothing lands in the operation log) that is always removed afterwards, even if
 the run fails.
 
+### Baseline files
+
+Instead of a base revision, the comparison can be against a recorded list of errors:
+
+```bash
+mypy-diff --write-baseline mypy-baseline.json -- src   # check the working copy, record its errors
+mypy-diff --baseline mypy-baseline.json -- src         # later: what is new since the recording?
+```
+
+Comparing with a baseline needs no history — a shallow clone in CI is fine — and only the target
+is checked, so it is one mypy run instead of two. Commit the file, and "no new errors" means the
+same thing on every machine and in every job; record it again when you have fixed some. The file is
+sorted JSON, so re-recording shows up as one small diff per error that came or went.
+
+It records the errors, the revision they are from, the mypy version, the mypy arguments and the
+project directory. A run that differs in any of these warns: another mypy version may word errors
+differently, and those would show up as changed or new.
+
+When the baseline was recorded from a clean tree, it names that commit, and as long as the
+repository has it, matching reads the files from there: errors are followed through edited lines
+and reworded ones show up as CHANGED, just as with `-b`. Recorded from uncommitted changes, the
+files the errors were found in exist nowhere any more; then an error matches when it is on the same
+line or has the same message somewhere in the same file, and the header says
+`recorded from uncommitted changes`. `-b` and `--tip` do not combine with either option.
+
 ### Options
 
 ```
@@ -207,6 +232,9 @@ the run fails.
                          Also exit 1 when a pre-existing error changed its message.
       --parallel / --no-parallel
                          Run mypy on base and working copy at once. Default: with 4+ CPUs.
+      --baseline FILE    Compare with the errors recorded in FILE instead of a base revision.
+      --write-baseline FILE
+                         Check the target, record its errors in FILE, then exit.
       --skip-version-check
       --doctor           Print detected tools and versions, then exit.
   -v, --verbose          Show resolved revisions and every command run (on stderr).
