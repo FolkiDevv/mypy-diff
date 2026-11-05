@@ -1355,6 +1355,15 @@ def test_staged_with_nothing_staged_runs_once(
     assert "the same files as the base" in result.stderr
 
 
+def test_doctor_shows_the_staged_comparison(
+    git_repo: Repo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(git_repo.root)
+    result = invoke(git_repo, "--doctor", "--staged")
+    assert "(HEAD: what the commit adds)" in result.stdout
+    assert "staged changes" in result.stdout
+
+
 def test_staged_and_to_exclude_each_other(git_repo: Repo, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.chdir(git_repo.root)
     result = invoke(git_repo, "--staged", "--to", "HEAD", "--", "src")
@@ -1480,6 +1489,18 @@ def test_mypy_diff_picks_the_backend_of_the_repository(
     monkeypatch.setattr(shutil, "which", lambda name: f"/bin/{name}" if jj_installed else None)
 
     assert detect_backend(nested) is expected
+
+
+def test_staged_picks_git_in_a_colocated_repository(
+    short_tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only git has an index: `mypy-diff --staged` in a git hook must not pick jj."""
+    (short_tmp_path / ".jj").mkdir()
+    (short_tmp_path / ".git").mkdir()
+    monkeypatch.setattr(shutil, "which", lambda name: f"/bin/{name}")
+
+    assert detect_backend(short_tmp_path) is JjBackend
+    assert detect_backend(short_tmp_path, needs_index=True) is GitBackend
 
 
 def test_the_nearest_repository_wins(short_tmp_path: Path) -> None:
