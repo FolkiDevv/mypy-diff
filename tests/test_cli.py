@@ -779,6 +779,23 @@ def test_a_base_check_that_reads_the_working_copy_is_refused(repo: Repo) -> None
     assert "lib/shared.py" in result.output
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="symlinks need privileges on Windows")
+def test_an_absolute_target_through_a_symlink_still_matches(
+    repo: Repo, short_tmp_path: Path
+) -> None:
+    """macOS's temp dir is /var/..., a symlink to /private/var/.... mypy prints a target as it
+    was given, while the working copy runs in the resolved directory: the paths used to come out
+    as '../../../var/...', and the pre-existing error as NEW plus FIXED."""
+    link = short_tmp_path / "link"
+    link.symlink_to(repo.root, target_is_directory=True)
+    repo.write("src/legacy.py", "# padding\n" + repo.read("src/legacy.py"))
+
+    result = invoke(repo, "--", str(link / "src"))
+
+    assert result.exit_code == EXIT_OK, result.output
+    assert "1 unchanged error" in result.output
+
+
 def test_installed_packages_in_a_venv_inside_the_repository_are_fine(
     repo: Repo, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -583,16 +583,20 @@ def _normalize_path(raw: str, workdir: Path) -> str:
     if not raw:
         return ""
     path = Path(raw)
-    if path.is_absolute():
+    if not path.is_absolute():
+        return path.as_posix()
+    # The same file can be spelled through a symlink (macOS: /var is /private/var): mypy prints a
+    # path as it was given, while the working directory may be its resolved form. Compare both.
+    for candidate, base in ((path, workdir), (path.resolve(), workdir.resolve())):
         try:
-            path = path.relative_to(workdir)
+            return candidate.relative_to(base).as_posix()
         except ValueError:
-            try:
-                path = Path(os.path.relpath(path, workdir))
-            except ValueError:
-                # Different drive on Windows — nothing sensible to relativize against.
-                return path.as_posix()
-    return path.as_posix()
+            continue
+    try:
+        return Path(os.path.relpath(path.resolve(), workdir.resolve())).as_posix()
+    except ValueError:
+        # Different drive on Windows — nothing sensible to relativize against.
+        return path.as_posix()
 
 
 # ------------------------------------------------------------------ environment fingerprint
