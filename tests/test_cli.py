@@ -1495,6 +1495,17 @@ def test_a_baseline_keeps_the_text_of_prepared_files(repo: Repo, short_tmp_path:
     assert "~ CHANGED (1)" in result.stdout
 
 
+def test_prepare_still_runs_when_nothing_changed(repo: Repo) -> None:
+    """A clean working copy is the base's tree, but only the base's checkout is prepared: the
+    one-run shortcut would skip the command, and a failing one would go unnoticed."""
+    command = f'"{sys.executable}" -c "import sys; sys.exit(4)"'
+
+    result = invoke(repo, "--prepare", command, "--", "src")
+
+    assert result.exit_code == EXIT_FAILURE, result.output
+    assert "--prepare failed" in result.stderr
+
+
 def test_a_failing_prepare_command_fails_the_run(repo: Repo) -> None:
     command = f'"{sys.executable}" -c "import sys; print(\'boom\'); sys.exit(3)"'
     repo.write("src/clean.py", repo.read("src/clean.py") + "\n# touched\n")

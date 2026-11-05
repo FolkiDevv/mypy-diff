@@ -507,7 +507,7 @@ def _run(
                 target_run = check_target(activity)
                 _refuse_missing_targets(target_run, target_rev)
                 base_run = _Checked(recorded.messages)
-            elif _same_tree(backend, base_rev, target_rev):
+            elif _same_tree(backend, base_rev, target_rev, prepare):
                 # Nothing differs between the two: check once, and compare that with itself.
                 errors.print(
                     Text("warning: ", style="bold yellow")
@@ -596,14 +596,22 @@ def _run(
     return EXIT_OK
 
 
-def _same_tree(backend: VcsBackend, base: RevisionInfo, target: RevisionInfo) -> bool:
+def _same_tree(
+    backend: VcsBackend, base: RevisionInfo, target: RevisionInfo, prepare: str | None = None
+) -> bool:
     """Whether base and target are the very same files, so one mypy run serves both.
 
     Files the VCS ignores are on disk, and mypy checks them in the working copy, but no checkout
     of the base has them — a generated module, say. Their errors are new as far as the base is
     concerned; one run compared with itself would report them as unchanged.
+
+    The same goes for --prepare with the working copy in place: the base's checkout is
+    prepared, the working copy is not. One run in place would skip the command altogether —
+    a failing one unnoticed, and whatever it makes left out of the comparison.
     """
     if not backend.same_tree(base, target):
+        return False
+    if target.is_working_copy and prepare:
         return False
     return not (target.is_working_copy and backend.ignored_python_files(limit=1))
 
