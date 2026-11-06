@@ -30,6 +30,7 @@ dependencies = [
 ]
 
 [project.scripts]
+mypy-diff = "mypy_diff.cli:main"
 mypy-diff-jj = "mypy_diff.cli:jj_main"
 mypy-diff-git = "mypy_diff.cli:git_main"
 

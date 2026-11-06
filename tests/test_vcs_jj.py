@@ -87,6 +87,45 @@ def test_working_copy_is_flagged_as_such(jj_repo: Repo) -> None:
     assert working.change_id
 
 
+def test_same_tree_of_a_fresh_empty_working_copy(jj_repo: Repo) -> None:
+    """A new, empty @ is another commit than its parent, with the very same files."""
+    jj = backend(jj_repo)
+    main = jj.resolve("main")
+    working = jj.working_copy()
+    assert working.commit_id != main.commit_id
+    assert jj.same_tree(main, working)
+
+
+def test_same_tree_sees_an_edit(jj_repo: Repo) -> None:
+    jj_repo.write("src/feature.py", "z: int = 3\n")
+    jj = backend(jj_repo)
+    assert not jj.same_tree(jj.resolve("main"), jj.working_copy())
+
+
+def test_snapshot_is_the_working_copy_commit(jj_repo: Repo) -> None:
+    jj_repo.write("src/untracked.py", "new: int = 2\n")
+    jj = backend(jj_repo)
+
+    snapshot = jj.snapshot()
+
+    assert snapshot.is_snapshot and not snapshot.is_working_copy
+    assert snapshot.commit_id == jj.working_copy().commit_id
+    assert jj.file_at(snapshot, "src/untracked.py") == "new: int = 2\n"
+
+
+def test_a_snapshot_gets_the_base_of_the_working_copy(jj_repo: Repo) -> None:
+    """The snapshot is @ itself: an @ that is already pushed is its own base, not its parent."""
+    assert JJ is not None
+    jj = JjBackend(JJ, cwd=jj_repo.root, verbose=True)
+    jj.default_base()
+    expected = jj.notes[-1]
+
+    jj.default_base(jj.snapshot())
+
+    assert jj.notes[-1] == expected
+    assert "@" in expected
+
+
 def test_file_at_reads_the_committed_content(jj_repo: Repo) -> None:
     jj = backend(jj_repo)
     jj_repo.write("src/clean.py", "COMPLETELY DIFFERENT\n")

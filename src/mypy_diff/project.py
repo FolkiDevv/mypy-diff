@@ -118,3 +118,61 @@ def _relative(directory: Path, root: Path, what: str) -> str:
             f"{what} is outside the repository.",
             f"The repository root is {root}.",
         ) from None
+
+
+def mypy_config_file(directory: Path, root: Path) -> Path | None:
+    """The config file mypy will read when run in ``directory``, if any.
+
+    The same search as mypy's own: in each directory from ``directory`` up to the repository
+    root, the first of ``CONFIG_FILES`` that is a mypy config.
+    """
+    root = root.resolve()
+    current = directory.resolve()
+    while True:
+        for name in CONFIG_FILES:
+            path = current / name
+            if path.is_file() and has_mypy_config_file(path):
+                return path
+        if current == root or current.parent == current:
+            return None
+        current = current.parent
+
+
+def has_mypy_config_file(path: Path) -> bool:
+    if path.name == "pyproject.toml":
+        return _has_tool_mypy(path)
+    if path.name == "setup.cfg":
+        return _has_mypy_section(path)
+    return True
+
+
+def configured_targets(path: Path) -> list[str]:
+    """The `files`, `packages` and `modules` a mypy config names, as written."""
+    if path.name == "pyproject.toml":
+        try:
+            section = (
+                tomllib.loads(path.read_text(encoding="utf-8")).get("tool", {}).get("mypy", {})
+            )
+        except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+            return []
+        found: list[str] = []
+        for key in ("files", "packages", "modules"):
+            value = section.get(key)
+            if isinstance(value, str):
+                found += [part.strip() for part in value.split(",") if part.strip()]
+            elif isinstance(value, list):
+                found += [str(part) for part in value]
+        return found
+    parser = configparser.RawConfigParser()
+    try:
+        parser.read(path)
+    except (configparser.Error, UnicodeDecodeError):
+        return []
+    if not parser.has_section("mypy"):
+        return []
+    return [
+        part.strip()
+        for key in ("files", "packages", "modules")
+        for part in parser.get("mypy", key, fallback="").split(",")
+        if part.strip()
+    ]

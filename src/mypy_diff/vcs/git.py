@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 import shutil
+import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -37,6 +39,8 @@ class GitBackend:
         self.notes: list[str] = []
         #: Shown always: something about the comparison the user should know.
         self.warnings: list[str] = []
+        #: How the last base was chosen, for the report header.
+        self.base_reason = ""
 
     # ---------------------------------------------------------------- basics
 
@@ -140,10 +144,16 @@ class GitBackend:
             if len(pushed) == 1:
                 base = self._describe(pushed[0])
                 if base is not None:
+                    self.base_reason = (
+                        "everything is pushed: uncommitted changes only"
+                        if base.commit_id == tip
+                        else "latest pushed ancestor"
+                    )
                     return base
             elif len(pushed) > 1:
                 merged = self._virtual_merge(pushed)
                 if merged is not None:
+                    self.base_reason = "merge of the pushed commits your work builds on"
                     return merged
                 self.warnings.append(
                     "Your unpushed work builds on several pushed commits ("
@@ -158,10 +168,12 @@ class GitBackend:
             if merge_base and (target.is_working_copy or merge_base != tip):
                 info = self._describe(merge_base)
                 if info is not None:
+                    self.base_reason = f"fork point with {revspec}"
                     return info
 
         parent = self._describe(f"{tip}~1")
         if parent is not None:
+            self.base_reason = "parent commit"
             return parent
         raise MypyDiffError(
             "Could not determine a base revision automatically.",
@@ -201,28 +213,155 @@ class GitBackend:
         if not tree:
             return None  # a conflict, or git < 2.38 without --write-tree
         tree = tree.splitlines()[0].strip()
-        identity = {
-            "GIT_AUTHOR_NAME": "mypy-diff",
-            "GIT_AUTHOR_EMAIL": "mypy-diff@localhost",
-            "GIT_AUTHOR_DATE": "@0 +0000",
-            "GIT_COMMITTER_NAME": "mypy-diff",
-            "GIT_COMMITTER_EMAIL": "mypy-diff@localhost",
-            "GIT_COMMITTER_DATE": "@0 +0000",
-        }
         message = "mypy-diff: merge of " + " and ".join(commit[:7] for commit in commits)
+        commit = self._synthetic_commit(tree, commits, message)
+        return None if commit is None else self._describe(commit)
+
+    def _synthetic_commit(self, tree: str, parents: list[str], message: str) -> str | None:
+        """A commit of ``tree`` that no branch points at, with a reproducible id.
+
+        Fixed author, committer and dates: the same tree on the same parents always gets the
+        same id, which the result cache and mypy's incremental cache key on. git's garbage
+        collection removes it eventually.
+        """
         completed = self._git.run(
             "commit-tree",
             "--no-gpg-sign",  # a signature would prompt, and its timestamp would change the id
             tree,
-            *(arg for c in commits for arg in ("-p", c)),
+            *(arg for parent in parents for arg in ("-p", parent)),
             "-m",
             message,
             check=False,
-            env=identity,
+            env=_SYNTHETIC_IDENTITY,
         )
         if completed.returncode != 0:
             return None
-        return self._describe(completed.stdout.strip())
+        return completed.stdout.strip()
+
+    def staged(self) -> RevisionInfo:
+        """What the next commit would hold: the index, as a commit on top of HEAD.
+
+        Inside a pre-commit hook git points GIT_INDEX_FILE at the index of the commit being
+        made — with `git commit -a` or `git commit <paths>`, a temporary one. Every other git
+        call here leaves that variable out (see `subprocess_env`); this one must read exactly
+        that index.
+        """
+        index = os.environ.get("GIT_INDEX_FILE")
+        if index:
+            # Relative to where mypy-diff was started; git here runs at the repository root.
+            index = os.path.abspath(index)
+        completed = self._git.run(
+            "write-tree", check=False, env={"GIT_INDEX_FILE": index} if index else None
+        )
+        if completed.returncode != 0:
+            raise MypyDiffError(
+                "Could not read the staged changes.",
+                *(line for line in completed.stderr.strip().splitlines() if line.strip()),
+                "Resolve the conflicts in the index first (`git status` lists them).",
+            )
+        head = self._git.try_out("rev-parse", "-q", "--verify", "HEAD^{commit}")
+        if not head:
+            raise MypyDiffError(
+                "--staged compares the staged changes with HEAD, and there is no commit yet.",
+                "Make the first commit without the check, or pass a base with -b.",
+            )
+        tree = completed.stdout.strip()
+        commit = self._synthetic_commit(tree, [head], "mypy-diff: staged changes")
+        if commit is None:
+            raise MypyDiffError("Could not make a commit of the staged changes.")
+        return RevisionInfo(
+            commit_id=commit, short_id=commit[:8], description="staged changes", is_staged=True
+        )
+
+    def is_shallow(self) -> bool:
+        """Whether this is a shallow clone, which may lack the fork point."""
+        return self._git.try_out("rev-parse", "--is-shallow-repository") == "true"
+
+    def has_uncommitted_changes(self) -> bool:
+        """Whether the working copy differs from HEAD: edits, staged or not, or new files."""
+        status = self._git.try_out("status", "--porcelain", "--untracked-files=normal")
+        return status is None or bool(status)
+
+    def same_tree(self, base: RevisionInfo, target: RevisionInfo) -> bool:
+        """Same files: no uncommitted changes, and commits with one tree (an empty commit, a
+        revert of a revert)."""
+        if target.is_working_copy and self.has_uncommitted_changes():
+            return False
+        if base.commit_id == target.commit_id:
+            return True
+        trees = [
+            self._git.try_out("rev-parse", "-q", "--verify", f"{rev.commit_id}^{{tree}}")
+            for rev in (base, target)
+        ]
+        return trees[0] is not None and trees[0] == trees[1]
+
+    def snapshot(self) -> RevisionInfo:
+        """The working copy as a commit on top of HEAD: tracked and untracked files as they are
+        on disk, deletions included, ignored files not.
+
+        Built in an index of its own, a copy of the real one so unchanged files need not be hashed
+        again; the repository's index, the user's staging, is never touched.
+
+        In the middle of a merge the working copy already holds the other side, so MERGE_HEAD
+        is a parent too: base selection and fork points then account for what the merge brought
+        in, exactly as they do for the working copy itself.
+        """
+        head = self._git.try_out("rev-parse", "-q", "--verify", "HEAD^{commit}")
+        if not head:
+            raise MypyDiffError(
+                "--isolated checks the working copy on top of HEAD, and there is no commit yet."
+            )
+        merge_head = self._git.try_out("rev-parse", "-q", "--verify", "MERGE_HEAD^{commit}")
+        with tempfile.TemporaryDirectory(prefix="mypy-diff-index-") as scratch:
+            index = Path(scratch) / "index"
+            current = self._git.try_out("rev-parse", "--git-path", "index")
+            source = self.root() / current if current else None
+            env = {"GIT_INDEX_FILE": str(index)}
+            if source is not None and source.is_file():
+                shutil.copyfile(source, index)
+                self._unflag_present_files(env)
+            else:
+                self._git.run("read-tree", head, env=env)
+            self._git.run("add", "--all", "--", ".", env=env)
+            tree = self._git.run("write-tree", env=env).stdout.strip()
+        parents = [head, merge_head] if merge_head else [head]
+        commit = self._synthetic_commit(tree, parents, "mypy-diff: working copy")
+        if commit is None:
+            raise MypyDiffError("Could not make a commit of the working copy.")
+        return RevisionInfo(
+            commit_id=commit,
+            short_id=commit[:8],
+            description="working copy",
+            is_snapshot=True,
+        )
+
+    def _unflag_present_files(self, env: dict[str, str]) -> None:
+        """Clear assume-unchanged and skip-worktree in a private index, for files on disk.
+
+        `git add` trusts both flags and would keep the indexed content of an edited file. A
+        skip-worktree file that is *not* on disk is a sparse checkout leaving it out: it keeps
+        its flag, so the snapshot keeps the committed file instead of recording a deletion.
+        """
+        listing = self._git.run("ls-files", "-v", "-z", env=env).stdout
+        root = self.root()
+        # `ls-files -v`: a lowercase tag is assume-unchanged, "S" skip-worktree. One flag per
+        # update-index call: given both, git applies only one of them.
+        assumed: list[str] = []
+        skipped: list[str] = []
+        for entry in listing.split("\0"):
+            if len(entry) < 3 or not os.path.lexists(root / entry[2:]):
+                continue
+            if entry[0].islower():
+                assumed.append(entry[2:])
+            if entry[0] in "Ss":
+                skipped.append(entry[2:])
+        for flag, paths in (("--no-assume-unchanged", assumed), ("--no-skip-worktree", skipped)):
+            for start in range(0, len(paths), 100):
+                self._git.run("update-index", flag, "--", *paths[start : start + 100], env=env)
+
+    def remote_branch(self, name: str) -> str:
+        """How to name the remote-tracking copy of a branch, e.g. the CI's target branch."""
+        return f"origin/{name}"
 
     def _has_remote_refs(self) -> bool:
         return bool(self._git.try_out("for-each-ref", "--format=%(refname)", "refs/remotes/"))
@@ -248,8 +387,10 @@ class GitBackend:
         """
         rev = self.resolve(revspec)
         if tip:
+            self.base_reason = f"tip of {revspec}"
             return rev
         best = self.fork_point(rev, target)
+        self.base_reason = f"fork point with {revspec}"
         if not self._names_a_branch(revspec, rev):
             # A tag or a commit id means exactly that revision.
             return best
@@ -270,6 +411,7 @@ class GitBackend:
         if better_spelling is not None:
             shown = self._git.try_out("rev-parse", "--abbrev-ref", better_spelling)
             shown = shown or better_spelling.removeprefix("refs/heads/")
+            self.base_reason = f"fork point with {shown}"
             self.warnings.append(
                 f"`{revspec}` ({rev.short_id}) is behind `{shown}`: using the fork point with "
                 f"`{shown}` ({best.short_id}), so commits already there do not show up as "
@@ -371,6 +513,17 @@ class GitBackend:
     def ignored_python_files(self, limit: int = 5) -> list[str]:
         """Python files in the working copy that git ignores: a clean checkout lacks them."""
         return _ignored_python_files(self._git, limit)
+
+
+#: Author and committer of the commits mypy-diff makes itself: fixed, so that their ids are too.
+_SYNTHETIC_IDENTITY = {
+    "GIT_AUTHOR_NAME": "mypy-diff",
+    "GIT_AUTHOR_EMAIL": "mypy-diff@localhost",
+    "GIT_AUTHOR_DATE": "@0 +0000",
+    "GIT_COMMITTER_NAME": "mypy-diff",
+    "GIT_COMMITTER_EMAIL": "mypy-diff@localhost",
+    "GIT_COMMITTER_DATE": "@0 +0000",
+}
 
 
 def _spellings_of(revspec: str) -> list[str]:

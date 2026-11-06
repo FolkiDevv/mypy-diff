@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import shutil
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -28,12 +29,12 @@ _TEMPLATE = (
 #: but the fork point is still pushed.
 _DEFAULT_BASE_REVSETS = (
     # The nearest pushed ancestor — the common case.
-    "heads({ancestors} & ::remote_bookmarks())",
+    ("heads({ancestors} & ::remote_bookmarks())", "nearest pushed ancestor"),
     # Nothing pushed yet: the nearest locally named ancestor (not the target itself).
-    "heads({proper} & (bookmarks() | tags()))",
+    ("heads({proper} & (bookmarks() | tags()))", "nearest bookmarked ancestor"),
     # Where the target forked from the trunk. `trunk()` alone may not be an ancestor at all.
-    "heads({proper} & ::trunk())",
-    "{parent}",
+    ("heads({proper} & ::trunk())", "fork point with trunk()"),
+    ("{parent}", "parent revision"),
 )
 
 _WORKSPACE_PREFIX = "mypy-diff-"
@@ -66,6 +67,8 @@ class JjBackend:
         self.notes: list[str] = []
         #: Shown always: something about the comparison the user should know.
         self.warnings: list[str] = []
+        #: How the last base was chosen, for the report header.
+        self.base_reason = ""
 
     # ---------------------------------------------------------------- basics
 
@@ -156,12 +159,13 @@ class JjBackend:
 
     def default_base(self, target: RevisionInfo | None = None) -> RevisionInfo:
         """The latest pushed (or else named) ancestor of ``target``, default the working copy."""
-        if target is None or target.is_working_copy:
+        # A snapshot (--isolated) is @ itself, checked out: the same commit, so the same base.
+        if target is None or target.is_working_copy or target.is_snapshot:
             ancestors, proper, parent = "::@", "::@-", "@-"
         else:
             proper = f"::({target.commit_id}-)"
             ancestors, parent = proper, f"{target.commit_id}-"
-        for template in _DEFAULT_BASE_REVSETS:
+        for template, reason in _DEFAULT_BASE_REVSETS:
             revset = template.format(ancestors=ancestors, proper=proper, parent=parent)
             # `trunk()` resolves to the root commit in a repo without a trunk; an empty tree
             # would report every single error as new.
@@ -169,6 +173,7 @@ class JjBackend:
             if found:
                 if self.verbose:
                     self.notes.append(f"Base resolved via revset `{revset}`.")
+                self.base_reason = reason
                 if len(found) > 1:
                     # A merge: several lines of pushed (or named) work meet below @.
                     self.warnings.append(
@@ -186,7 +191,49 @@ class JjBackend:
     def resolve_base(self, revspec: str, target: RevisionInfo, tip: bool) -> RevisionInfo:
         """The base for ``-b REVSPEC``: its fork point with ``target``, or its tip with --tip."""
         rev = self.resolve(revspec)
+        self.base_reason = f"tip of {revspec}" if tip else f"fork point with {revspec}"
         return rev if tip else self.fork_point(rev, target)
+
+    def is_shallow(self) -> bool:
+        """jj does not make shallow clones of its own; the git store would say otherwise."""
+        return False
+
+    def has_uncommitted_changes(self) -> bool:
+        """Never: the up-front snapshot made @ exactly what is on disk."""
+        return False
+
+    def same_tree(self, base: RevisionInfo, target: RevisionInfo) -> bool:
+        """Same files. The usual case is a fresh, empty @ on top of the base: another commit,
+        but nothing in it."""
+        if base.commit_id == target.commit_id:
+            return True
+        completed = self._jj.run(
+            "diff",
+            "--from",
+            base.commit_id,
+            "--to",
+            target.commit_id,
+            "--summary",
+            "--ignore-working-copy",
+            check=False,
+        )
+        return completed.returncode == 0 and not completed.stdout.strip()
+
+    def snapshot(self) -> RevisionInfo:
+        """`@` itself: jj already made the working copy a commit, when it was snapshotted."""
+        return dataclasses.replace(self.working_copy(), is_working_copy=False, is_snapshot=True)
+
+    def staged(self) -> RevisionInfo:
+        """jj has no staging area: there is nothing between the working copy and a commit."""
+        raise MypyDiffError(
+            "--staged is for git's index; jj has none.",
+            "The working copy is already a commit: check it as it is, or split off the part "
+            "to check with `jj split` and pass it with --to.",
+        )
+
+    def remote_branch(self, name: str) -> str:
+        """How to name the remote copy of a branch, e.g. the CI's target branch."""
+        return f'remote_bookmarks(exact:"{name}", exact:"origin")'
 
     def fork_point(self, rev: RevisionInfo, target: RevisionInfo | None = None) -> RevisionInfo:
         """The common ancestor of ``rev`` and ``target`` (default: the working copy, ``@``).
@@ -194,7 +241,10 @@ class JjBackend:
         fork_point(x) == heads(::x_1 & ... & ::x_N); when ``rev`` is already an ancestor of the
         target this resolves to ``rev`` itself, which is what we want.
         """
-        other = "@" if target is None or target.is_working_copy else target.commit_id
+        if target is None or target.is_working_copy or target.is_snapshot:
+            other = "@"  # a snapshot (--isolated) is @ itself
+        else:
+            other = target.commit_id
         found = self._log(f"fork_point({rev.commit_id} | {other})", check=False)
         return found[0] if found else rev
 

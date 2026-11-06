@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -102,6 +103,122 @@ def test_working_copy_is_flagged_as_such(git_repo: Repo) -> None:
     working = backend(git_repo).working_copy()
     assert working.is_working_copy
     assert working.commit_id == backend(git_repo).resolve("HEAD").commit_id
+
+
+def test_same_tree_needs_a_clean_working_copy(git_repo: Repo) -> None:
+    git = backend(git_repo)
+    head, working = git.resolve("HEAD"), git.working_copy()
+    assert git.same_tree(head, working)
+
+    git_repo.write("src/feature.py", "z: int = 3\n")
+    assert not git.same_tree(head, working)
+
+
+def test_same_tree_sees_through_an_empty_commit(git_repo: Repo) -> None:
+    assert GIT is not None
+    git = backend(git_repo)
+    main = git.resolve("main")
+    run([GIT, "commit", "-q", "--allow-empty", "-m", "nothing"], cwd=git_repo.root)
+
+    assert git.same_tree(main, git.resolve("HEAD"))
+    git_repo.write("src/feature.py", "z: int = 3\n")
+    commit(git_repo, "something")
+    assert not git.same_tree(main, git.resolve("HEAD"))
+
+
+def test_staged_is_the_index_on_top_of_head(git_repo: Repo) -> None:
+    assert GIT is not None
+    git = backend(git_repo)
+    git_repo.write("src/staged.py", "x: int = 1\n")
+    run([GIT, "add", "src/staged.py"], cwd=git_repo.root)
+    git_repo.write("src/unstaged.py", "y: int = 2\n")
+
+    staged = git.staged()
+
+    assert staged.is_staged and not staged.is_working_copy
+    assert parents(git_repo, staged.commit_id) == {git.resolve("HEAD").commit_id}
+    assert git.file_at(staged, "src/staged.py") == "x: int = 1\n"
+    assert git.file_at(staged, "src/unstaged.py") is None
+    # Reproducible: the same index on the same HEAD is the same commit, so caches hit.
+    assert backend(git_repo).staged().commit_id == staged.commit_id
+
+
+def test_staged_reads_the_index_of_the_commit_being_made(
+    git_repo: Repo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """In a pre-commit hook of `git commit -a`, GIT_INDEX_FILE names a temporary index."""
+    assert GIT is not None
+    temporary = git_repo.root / ".git" / "next-index.lock"
+    env = {**os.environ, "GIT_INDEX_FILE": str(temporary)}
+    subprocess.run([GIT, "read-tree", "HEAD"], cwd=git_repo.root, env=env, check=True)
+    git_repo.write("src/hook.py", "z: int = 3\n")
+    subprocess.run([GIT, "add", "src/hook.py"], cwd=git_repo.root, env=env, check=True)
+    monkeypatch.setenv("GIT_INDEX_FILE", str(temporary))
+
+    staged = backend(git_repo).staged()
+
+    assert backend(git_repo).file_at(staged, "src/hook.py") == "z: int = 3\n"
+
+
+def test_a_relative_index_path_is_relative_to_where_mypy_diff_runs(
+    git_repo: Repo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """git runs at the repository root; a path given from src/ must still mean the same file."""
+    assert GIT is not None
+    temporary = git_repo.root / ".git" / "next-index.lock"
+    env = {**os.environ, "GIT_INDEX_FILE": str(temporary)}
+    subprocess.run([GIT, "read-tree", "HEAD"], cwd=git_repo.root, env=env, check=True)
+    git_repo.write("src/hook.py", "z: int = 3\n")
+    subprocess.run([GIT, "add", "src/hook.py"], cwd=git_repo.root, env=env, check=True)
+    monkeypatch.chdir(git_repo.root / "src")
+    monkeypatch.setenv("GIT_INDEX_FILE", os.path.join("..", ".git", "next-index.lock"))
+
+    staged = backend(git_repo).staged()
+
+    assert backend(git_repo).file_at(staged, "src/hook.py") == "z: int = 3\n"
+
+
+def test_staged_with_a_conflict_in_the_index_is_an_error(git_repo: Repo) -> None:
+    assert GIT is not None
+    git = backend(git_repo)
+
+    def feed(argv: list[str], data: bytes) -> str:
+        # Bytes, not text: on Windows text mode would turn "\n" into "\r\n" on the way in.
+        completed = subprocess.run(
+            argv, cwd=git_repo.root, input=data, capture_output=True, check=True
+        )
+        return completed.stdout.decode("ascii")
+
+    blob = feed([GIT, "hash-object", "-w", "--stdin"], b"a\n").strip()
+    # Stage 1 ("common ancestor") of an unresolved merge conflict.
+    entry = f"100644 {blob} 1\tsrc/conflict.py\0".encode("ascii")
+    feed([GIT, "update-index", "-z", "--index-info"], entry)
+
+    with pytest.raises(MypyDiffError, match="Could not read the staged changes"):
+        git.staged()
+
+
+def test_snapshot_is_the_working_copy_without_ignored_files(git_repo: Repo) -> None:
+    assert GIT is not None
+    git = backend(git_repo)
+    (git_repo.root / ".git" / "info" / "exclude").write_text("ignored.py\n", encoding="utf-8")
+    git_repo.write("src/clean.py", "edited: int = 1\n")
+    git_repo.write("src/untracked.py", "new: int = 2\n")
+    git_repo.write("src/ignored.py", "secret: int = 3\n")
+    (git_repo.root / "src" / "legacy.py").unlink()
+    index_before = run([GIT, "ls-files", "--stage"], cwd=git_repo.root).stdout
+
+    snapshot = git.snapshot()
+
+    assert snapshot.is_snapshot and not snapshot.is_working_copy
+    assert parents(git_repo, snapshot.commit_id) == {git.resolve("HEAD").commit_id}
+    assert git.file_at(snapshot, "src/clean.py") == "edited: int = 1\n"
+    assert git.file_at(snapshot, "src/untracked.py") == "new: int = 2\n"
+    assert git.file_at(snapshot, "src/ignored.py") is None
+    assert git.file_at(snapshot, "src/legacy.py") is None
+    # The user's staging is left exactly as it was.
+    assert run([GIT, "ls-files", "--stage"], cwd=git_repo.root).stdout == index_before
+    assert backend(git_repo).snapshot().commit_id == snapshot.commit_id
 
 
 def test_file_at_reads_the_committed_content(git_repo: Repo) -> None:
@@ -436,3 +553,45 @@ def test_mid_merge_fork_point_counts_the_merged_side(git_repo: Repo, short_tmp_p
     _, main = merge_main_into_pushed_feature(git_repo, short_tmp_path, commit_merge=False)
     git = backend(git_repo)
     assert git.resolve_base("origin/main", git.working_copy(), tip=False).commit_id == main
+
+
+def test_a_snapshot_mid_merge_keeps_the_other_side_as_a_parent(
+    git_repo: Repo, short_tmp_path: Path
+) -> None:
+    """The working copy holds what the merge brought in; the snapshot must say where from."""
+    feature, main = merge_main_into_pushed_feature(git_repo, short_tmp_path, commit_merge=False)
+    git = backend(git_repo)
+
+    snapshot = git.snapshot()
+
+    assert parents(git_repo, snapshot.commit_id) == {feature, main}
+    base = git.default_base(snapshot)
+    assert parents(git_repo, base.commit_id) == {feature, main}
+
+
+def test_a_snapshot_sees_edits_behind_index_flags(git_repo: Repo) -> None:
+    """assume-unchanged and skip-worktree make `git add` keep the indexed content."""
+    assert GIT is not None
+    git = backend(git_repo)
+    run([GIT, "update-index", "--assume-unchanged", "src/clean.py"], cwd=git_repo.root)
+    run([GIT, "update-index", "--skip-worktree", "src/legacy.py"], cwd=git_repo.root)
+    git_repo.write("src/clean.py", "edited: int = 1\n")
+    git_repo.write("src/legacy.py", "also_edited: int = 2\n")
+
+    snapshot = git.snapshot()
+
+    assert git.file_at(snapshot, "src/clean.py") == "edited: int = 1\n"
+    assert git.file_at(snapshot, "src/legacy.py") == "also_edited: int = 2\n"
+
+
+def test_a_snapshot_keeps_what_a_sparse_checkout_leaves_out(git_repo: Repo) -> None:
+    """A skip-worktree file that is not on disk is not deleted: it is just not checked out."""
+    assert GIT is not None
+    git = backend(git_repo)
+    committed = git_repo.read("src/legacy.py")
+    run([GIT, "update-index", "--skip-worktree", "src/legacy.py"], cwd=git_repo.root)
+    (git_repo.root / "src" / "legacy.py").unlink()
+
+    snapshot = git.snapshot()
+
+    assert git.file_at(snapshot, "src/legacy.py") == committed

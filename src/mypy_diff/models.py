@@ -32,10 +32,18 @@ class RevisionInfo:
     is_working_copy: bool = False
     #: jj change id; empty for the git backend.
     change_id: str = ""
+    #: True when this is a commit mypy-diff made of git's index (``--staged``).
+    is_staged: bool = False
+    #: True when this is the working copy as a commit, checked out like any other (``--isolated``).
+    is_snapshot: bool = False
 
     def label(self) -> str:
         if self.is_working_copy:
             return "working copy (uncommitted)"
+        if self.is_staged:
+            return f"{self.short_id}  staged changes"
+        if self.is_snapshot:
+            return f"{self.short_id}  working copy, checked out on its own"
         parts = [self.change_id, self.short_id] if self.change_id else [self.short_id]
         if self.refs:
             parts.append(" ".join(self.refs))
@@ -68,12 +76,20 @@ class MypyMessage:
         return (self.path, self.line, self.column, self.code or "", self.message)
 
     def format(self) -> str:
-        """Render exactly the way mypy itself would, so output stays greppable."""
+        """Render exactly the way mypy itself would, so output stays greppable and clickable.
+
+        mypy's JSON column is 0-based; its text output, and every editor, count from 1.
+        """
         position = f"{self.path}:{self.line}"
-        if self.column is not None:
-            position += f":{self.column}"
+        if self.column is not None and self.column >= 0:
+            position += f":{self.column + 1}"
         suffix = f"  [{self.code}]" if self.code else ""
         return f"{position}: {self.severity.value}: {self.message}{suffix}"
+
+    def note_lines(self) -> list[str]:
+        """mypy's notes for this diagnostic: its hint (same location), then attached notes."""
+        hint = [line for line in self.hint.splitlines() if line.strip()]
+        return [*hint, *self.notes]
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -89,7 +105,10 @@ class MypyMessage:
 
     @classmethod
     def from_json(cls, raw: dict[str, Any]) -> Self:
-        return cls(
+        """The inverse of :meth:`to_json`. Raises ValueError (or KeyError, TypeError) on anything
+        :meth:`to_json` could not have written: a cache entry or baseline file that was edited
+        or truncated must be rejected here, not crash the matching later."""
+        message = cls(
             path=raw["path"],
             line=raw["line"],
             column=raw["column"],
@@ -99,6 +118,21 @@ class MypyMessage:
             hint=raw.get("hint", ""),
             notes=tuple(raw.get("notes", ())),
         )
+        if not (
+            isinstance(message.path, str)
+            and _is_int(message.line)
+            and (message.column is None or _is_int(message.column))
+            and isinstance(message.message, str)
+            and (message.code is None or isinstance(message.code, str))
+            and isinstance(message.hint, str)
+            and all(isinstance(note, str) for note in message.notes)
+        ):
+            raise ValueError(f"not a diagnostic: {raw!r}")
+        return message
+
+
+def _is_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,6 +146,8 @@ class DiffResult:
     changed: tuple[tuple[MypyMessage, MypyMessage], ...] = ()
     #: Set when the comparison could not be done in full; says why. The lists are then partial.
     incomplete: str = ""
+    #: How the base was chosen, for display: "fork point with main", "latest pushed ancestor".
+    base_reason: str = ""
     #: Matching statistics: "moved" (unchanged errors that matched at another position),
     #: "moved_between_files" (the subset that moved to another file).
     stats: dict[str, int] = field(default_factory=dict)

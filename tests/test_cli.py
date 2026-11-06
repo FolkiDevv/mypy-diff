@@ -16,7 +16,7 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner, Result
 
-from mypy_diff.cli import EXIT_FAILURE, EXIT_NEW_ERRORS, EXIT_OK, build_app
+from mypy_diff.cli import EXIT_FAILURE, EXIT_NEW_ERRORS, EXIT_OK, build_app, detect_backend, main
 from mypy_diff.vcs import GitBackend, JjBackend
 
 from .conftest import GIT, JJ, SUBPROJECT, Repo, run
@@ -69,6 +69,52 @@ def test_doctor_reports_the_tools(repo: Repo) -> None:
     assert repo.vcs in result.output
     assert "mypy" in result.output
     assert "repository root" in result.output
+
+
+def test_doctor_shows_what_a_run_would_use(repo: Repo, short_tmp_path: Path) -> None:
+    """The config mypy reads, what it would check, the base and why, and the cache."""
+    result = invoke(repo, "--doctor", "-b", "main", cache=short_tmp_path / "cache")
+    assert "mypy config      pyproject.toml" in result.stdout
+    # The fixture's config names no files: exactly the "no files to check" trap.
+    assert "none configured: pass them after `--`" in result.stdout
+    assert "(fork point with main)" in result.stdout
+    assert str(short_tmp_path / "cache") in result.stdout
+
+
+def test_doctor_honours_an_explicit_config_file(repo: Repo) -> None:
+    """mypy reads the --config-file after `--`, not the one it would find by itself."""
+    repo.write("custom.ini", "[mypy]\nfiles = lib\n")
+    result = invoke(repo, "--doctor", "--", "--config-file", "custom.ini", "src")
+    assert "mypy config      custom.ini  (--config-file)" in result.stdout
+    assert "targets          --config-file custom.ini src  (after `--`)" in result.stdout
+
+    missing = invoke(repo, "--doctor", "--", "--config-file", "nope.ini")
+    assert "nope.ini  (--config-file: no such file)" in missing.stdout
+    assert "none configured: pass them after `--`" in missing.stdout
+
+
+def test_doctor_warns_about_a_foreign_virtualenv(
+    repo: Repo, short_tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An activated virtualenv wins over the project's own .venv; say so when they differ."""
+    own = repo.root / ".venv" / ("Scripts" if sys.platform == "win32" else "bin")
+    own.mkdir(parents=True)
+    other = short_tmp_path / "other-venv"
+    binaries = other / ("Scripts" if sys.platform == "win32" else "bin")
+    binaries.mkdir(parents=True)
+    mypy = binaries / ("mypy.exe" if sys.platform == "win32" else "mypy")
+    if sys.platform == "win32":
+        pytest.skip("needs an executable script")
+    mypy.write_text(f'#!/bin/sh\nexec {sys.executable} -m mypy "$@"\n', encoding="utf-8")
+    mypy.chmod(0o755)
+    monkeypatch.setenv("VIRTUAL_ENV", str(other))
+    monkeypatch.delenv("MYPY_DIFF_MYPY", raising=False)
+
+    app = build_app(JjBackend if repo.vcs == "jj" else GitBackend)
+    result = runner.invoke(app, ["--doctor"], catch_exceptions=False)
+
+    assert "mypy found via   active virtualenv" in result.stdout
+    assert "not from the project's own" in result.stdout
 
 
 def test_clean_working_copy_reports_no_change(repo: Repo) -> None:
@@ -209,10 +255,90 @@ def test_json_format_is_parseable(repo: Repo) -> None:
     assert payload["new"][0]["code"] == "return-value"
 
 
+def test_verbose_output_stays_off_stdout(repo: Repo) -> None:
+    """`--format json -v` used to put the header and `$ git ...` lines into the JSON."""
+    repo.write("src/clean.py", BROKEN_SOURCE)
+    result = invoke(repo, "-v", "--format", "json", "--", "src")
+    assert json.loads(result.stdout)["summary"]["new"] == 1
+    assert "base " in result.stderr
+
+
+def test_forced_colours_never_reach_machine_output(
+    repo: Repo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CI often exports FORCE_COLOR; it used to put escape codes into JSON and plain output."""
+    monkeypatch.setenv("FORCE_COLOR", "1")
+    monkeypatch.setenv("TTY_COMPATIBLE", "1")
+    repo.write("src/clean.py", BROKEN_SOURCE)
+    assert json.loads(invoke(repo, "--format", "json", "--", "src").stdout)["summary"]["new"] == 1
+    assert "\x1b" not in invoke(repo, "--format", "plain", "--", "src").stdout
+
+
+def test_columns_are_one_based_like_mypy_prints_them(repo: Repo) -> None:
+    repo.write("src/clean.py", BROKEN_SOURCE)
+    # `    return 42`: mypy reports column 12, counting from 1.
+    assert "src/clean.py:6:12: error:" in invoke(repo, "--", "src").output
+
+
+def test_the_header_says_how_the_base_was_chosen(repo: Repo) -> None:
+    header = invoke(repo, "-b", "main", "--", "src").stdout.splitlines()[0]
+    assert "(fork point with main)" in header
+
+
+def test_github_format_writes_the_job_summary_and_a_verdict(
+    repo: Repo, short_tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    summary = short_tmp_path / "summary.md"
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+    repo.write("src/clean.py", BROKEN_SOURCE)
+
+    result = invoke(repo, "--format", "github", "--", "src")
+
+    text = summary.read_text(encoding="utf-8")
+    assert "## mypy-diff" in text
+    assert "src/clean.py:6:12" in text
+    assert "Found 1 new" in result.stderr
+    assert result.stdout.startswith("::error file=src/clean.py,line=6")
+
+
+@pytest.mark.skipif(GIT is None, reason="git is not installed")
+def test_a_pull_request_job_compares_against_its_target_branch(
+    git_repo: Repo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """In CI everything is pushed, so the default base used to be HEAD itself: "No change"."""
+    assert GIT is not None
+    monkeypatch.chdir(git_repo.root)
+    run([GIT, "checkout", "-q", "-b", "feature"], cwd=git_repo.root)
+    git_repo.write("src/clean.py", BROKEN_SOURCE)
+    run([GIT, "commit", "-qam", "feature adds an error"], cwd=git_repo.root)
+    run([GIT, "push", "-q", "-u", "origin", "feature"], cwd=git_repo.root)
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setenv("GITHUB_BASE_REF", "main")
+
+    result = invoke(git_repo, "--", "src")
+
+    assert result.exit_code == EXIT_NEW_ERRORS, result.output
+    assert "+ NEW (1)" in result.output
+    assert "GITHUB_BASE_REF" in result.output.splitlines()[0]
+
+
 def test_github_format_emits_annotations(repo: Repo) -> None:
     repo.write("src/clean.py", BROKEN_SOURCE)
     result = invoke(repo, "--format", "github", "--", "src")
     assert "::error file=src/clean.py,line=6" in result.output
+
+
+@pytest.mark.parametrize("output_format", ["sarif", "gitlab"])
+def test_report_formats_write_pure_json_and_log_the_verdict(repo: Repo, output_format: str) -> None:
+    """The report goes to a file the CI system picks up; the verdict to the job log."""
+    repo.write("src/clean.py", BROKEN_SOURCE)
+    result = invoke(repo, "--format", output_format, "--", "src")
+
+    assert result.exit_code == EXIT_NEW_ERRORS
+    report = json.loads(result.stdout)
+    issues = report["runs"][0]["results"] if output_format == "sarif" else report
+    assert len(issues) == 1
+    assert "1 new" in result.stderr
 
 
 def test_only_new_filters_the_output(repo: Repo) -> None:
@@ -371,13 +497,57 @@ def test_no_cache_leaves_nothing_behind(repo: Repo, isolated_cache: Path) -> Non
 
 
 def test_a_normal_run_keeps_mypy_caches_apart(repo: Repo, short_tmp_path: Path) -> None:
-    """Base and working copy must not share one incremental cache directory."""
+    """Base and working copy must not share one incremental cache directory; across runs each
+    side keeps its own, whatever commit it checks."""
     cache = short_tmp_path / "cache"
+    repo.write("src/clean.py", BROKEN_SOURCE)
     invoke(repo, "--", "src", cache=cache)
 
-    directories = sorted(p.name for p in (cache / "mypy-cache").iterdir())
-    assert len(directories) == 2, directories
-    assert any(name.endswith("-wc") for name in directories)
+    projects = list((cache / "mypy-cache").iterdir())
+    assert len(projects) == 1, projects
+    assert sorted(p.name for p in projects[0].iterdir()) == ["base", "target"]
+
+
+def test_an_unchanged_working_copy_is_checked_once(repo: Repo) -> None:
+    """Base and target are the same tree: one mypy run, and a word that nothing is compared.
+
+    In CI with everything pushed, the default base is HEAD itself, which used to cost two full
+    runs and say nothing but "No change".
+    """
+    result = invoke(repo, "-v", "--", "src")
+    assert result.exit_code == EXIT_OK, result.output
+    assert "the same files as the base" in result.stderr
+    assert "checked out" not in result.stderr
+    assert "1 unchanged error" in result.stdout
+
+
+def test_an_ignored_module_is_not_compared_with_itself(
+    git_repo: Repo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The tree is unchanged, but mypy checks a file the base checkout cannot have.
+
+    Taking one run for both would report its errors as unchanged, and pass.
+    """
+    monkeypatch.chdir(git_repo.root)
+    (git_repo.root / ".git" / "info").mkdir(parents=True, exist_ok=True)
+    (git_repo.root / ".git" / "info" / "exclude").write_text("generated.py\n", encoding="utf-8")
+    git_repo.write("src/generated.py", BROKEN_SOURCE)
+
+    result = invoke(git_repo, "--", "src")
+
+    assert result.exit_code == EXIT_NEW_ERRORS, result.output
+    assert "src/generated.py:6" in result.stdout
+    assert "the same files as the base" not in result.stderr
+
+
+@pytest.mark.parametrize("flag", ["--parallel", "--no-parallel"])
+def test_parallel_and_sequential_runs_agree(repo: Repo, flag: str) -> None:
+    repo.write("src/clean.py", BROKEN_SOURCE)
+    repo.write("src/legacy.py", "# padding\n" + repo.read("src/legacy.py"))
+    result = invoke(repo, flag, "--", "src")
+    assert result.exit_code == EXIT_NEW_ERRORS, result.output
+    assert "+ NEW (1)" in result.stdout
+    assert "1 unchanged error" in result.stdout
 
 
 def test_retention_caps_the_incremental_cache(
@@ -660,6 +830,7 @@ def test_an_environment_change_misses_the_cache(
     another: after installing stubs, pre-existing errors used to come out NEW."""
     cache = short_tmp_path / "cache"
     monkeypatch.delenv("MYPYPATH", raising=False)
+    repo.write("src/extra.py", "extra: int = 1\n")  # a change, so the base is checked too
     invoke(repo, "--", "src", cache=cache)
     assert "cache hit" in invoke(repo, "-v", "--", "src", cache=cache).output
 
@@ -840,6 +1011,7 @@ def test_an_outside_config_file_is_part_of_the_cache_key(repo: Repo, short_tmp_p
     config = short_tmp_path / "shared.ini"
     config.write_text("[mypy]\npython_version = 3.12\n", encoding="utf-8")
     arguments = ("--", "--config-file", str(config), "src")
+    repo.write("src/extra.py", "extra: int = 1\n")  # a change, so the base is checked too
     invoke(repo, *arguments, cache=cache)
     assert "cache hit" in invoke(repo, "-v", *arguments, cache=cache).output
 
@@ -865,11 +1037,13 @@ def test_a_generated_module_the_base_lacks_is_pointed_out(
     git_repo.write("src/app.py", 'import gen_pb2\n\nlabel = "v" + gen_pb2.VERSION\n')
     commit_as_main(git_repo, "uses generated code")
     git_repo.write("src/gen_pb2.py", "VERSION: int = 1\n")
+    git_repo.write("src/extra.py", "extra: int = 1\n")  # some work, so the base is checked
 
     result = invoke(git_repo, "-b", "main", "--", "src")
 
     assert "import error exists only in the base" in result.output
     assert "src/gen_pb2.py" in result.output
+    assert "pass --isolated" in result.output
 
 
 # ------------------------------------------------------------------ changed errors
@@ -899,6 +1073,512 @@ def test_help_mentions_the_right_vcs(factory: Callable[..., object]) -> None:
     result = runner.invoke(build_app(factory), ["--help"])  # type: ignore[arg-type]
     assert result.exit_code == EXIT_OK
     assert factory.name in result.output  # type: ignore[attr-defined]
+
+
+def test_help_shows_examples_and_exit_codes() -> None:
+    result = runner.invoke(build_app(GitBackend, prog="mypy-diff"), ["--help"])
+    assert result.exit_code == EXIT_OK
+    assert "mypy-diff -b main --tip" in result.output
+    assert "Exit codes:" in result.output
+    assert "2  mypy-diff itself failed" in result.output
+
+
+def test_tip_without_a_branch_is_an_error(repo: Repo) -> None:
+    """It used to be ignored: the run compared with the fork point and said nothing."""
+    result = invoke(repo, "--tip", "--", "src")
+    assert result.exit_code == EXIT_FAILURE
+    assert "--tip needs a branch" in result.stderr
+
+
+# ------------------------------------------------------------------ [tool.mypy-diff]
+
+
+def configure(repo: Repo, table: str) -> None:
+    """Add a [tool.mypy-diff] table to the fixture's pyproject.toml in the working copy."""
+    repo.write("pyproject.toml", repo.read("pyproject.toml") + "\n[tool.mypy-diff]\n" + table)
+
+
+def test_the_config_supplies_the_base_and_the_targets(repo: Repo) -> None:
+    configure(repo, 'base = "main"\nargs = ["src"]\n')
+    repo.write("src/clean.py", BROKEN_SOURCE)
+
+    result = invoke(repo)  # no `--`: the targets come from the config
+
+    assert result.exit_code == EXIT_NEW_ERRORS, result.output
+    assert "+ NEW (1)" in result.stdout
+    assert "fork point with main, from [tool.mypy-diff]" in result.stdout.splitlines()[0]
+
+
+def test_the_command_line_beats_the_config(repo: Repo) -> None:
+    configure(repo, 'format = "json"\nonly = "new"\n')
+    repo.write("src/legacy.py", "def broken() -> str:\n    return 'now correct'\n")
+
+    from_config = invoke(repo, "--", "src")
+    assert json.loads(from_config.stdout)["only"] == "new"
+
+    overridden = invoke(repo, "--format", "plain", "--", "src")
+    assert not overridden.stdout.lstrip().startswith("{")
+    # What the command line leaves alone still comes from the file.
+    assert "FIXED" not in overridden.stdout
+
+
+def test_a_paired_flag_turns_a_configured_option_off(repo: Repo) -> None:
+    configure(repo, "fail-on-changed = true\n")
+    repo.write("src/legacy.py", 'def broken() -> float:\n    return "already wrong"\n')
+
+    assert invoke(repo, "--", "src").exit_code == EXIT_NEW_ERRORS
+    assert invoke(repo, "--no-fail-on-changed", "--", "src").exit_code == EXIT_OK
+
+
+def test_a_config_mistake_fails_the_run(repo: Repo) -> None:
+    configure(repo, 'bse = "main"\n')
+    result = invoke(repo, "--", "src")
+    assert result.exit_code == EXIT_FAILURE
+    assert "unknown key 'bse'" in result.stderr
+
+
+def test_the_config_mypy_command_is_used(repo: Repo, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("MYPY_DIFF_MYPY", raising=False)
+    configure(repo, f"mypy-cmd = '\"{sys.executable}\" -m mypy'\n")
+
+    app = build_app(JjBackend if repo.vcs == "jj" else GitBackend)
+    result = runner.invoke(app, ["--doctor"], catch_exceptions=False)
+
+    assert "mypy found via   mypy-cmd in [tool.mypy-diff]" in result.stdout
+    assert "settings         pyproject.toml  [tool.mypy-diff]" in result.stdout
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="needs an executable script")
+def test_a_relative_config_mypy_command_works_from_a_subdirectory(
+    repo: Repo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The path is relative to the pyproject.toml it is written in, not to where you are."""
+    monkeypatch.delenv("MYPY_DIFF_MYPY", raising=False)
+    script = repo.root / "tools" / "mypy"
+    script.parent.mkdir()
+    script.write_text(f'#!/bin/sh\nexec "{sys.executable}" -m mypy "$@"\n', encoding="utf-8")
+    script.chmod(0o755)
+    configure(repo, 'mypy-cmd = "tools/mypy"\n')
+    monkeypatch.chdir(repo.root / "src")
+
+    app = build_app(JjBackend if repo.vcs == "jj" else GitBackend)
+    result = runner.invoke(app, ["--doctor"], catch_exceptions=False)
+
+    assert result.exit_code == EXIT_OK, result.output
+    # Resolved: on macOS the temporary directory is a symlink (/var -> /private/var).
+    assert f"({script.resolve()})" in result.stdout
+
+
+def test_doctor_shows_the_targets_a_run_would_use(repo: Repo) -> None:
+    configure(repo, 'args = ["src"]\n')
+    from_config = invoke(repo, "--doctor")
+    assert "targets          src  (args in [tool.mypy-diff])" in from_config.stdout
+
+    overridden = invoke(repo, "--doctor", "--", "src/clean.py")
+    assert "targets          src/clean.py  (after `--`)" in overridden.stdout
+
+
+def test_on_a_pull_request_its_target_beats_the_configured_base(
+    git_repo: Repo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A PR into a release branch must not be compared with the configured main."""
+    monkeypatch.chdir(git_repo.root)
+    configure(git_repo, 'base = "no-such-branch"\n')
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setenv("GITHUB_BASE_REF", "main")
+
+    result = invoke(git_repo, "--", "src")
+
+    assert result.exit_code == EXIT_OK, result.output
+    assert "GITHUB_BASE_REF" in result.stdout.splitlines()[0]
+
+
+# ------------------------------------------------------------------ baseline files
+
+
+def test_a_baseline_of_an_unchanged_tree_reports_no_change(
+    repo: Repo, short_tmp_path: Path
+) -> None:
+    baseline = short_tmp_path / "baseline.json"
+
+    written = invoke(repo, "--write-baseline", str(baseline), "--", "src")
+    assert written.exit_code == EXIT_OK, written.output
+    assert "Recorded 1 error" in written.stderr
+    recorded = json.loads(baseline.read_text(encoding="utf-8"))
+    assert [m["path"] for m in recorded["messages"]] == ["src/legacy.py"]
+
+    compared = invoke(repo, "--baseline", str(baseline), "--", "src")
+    assert compared.exit_code == EXIT_OK, compared.output
+    assert "No change in mypy errors." in compared.stdout
+    assert f"baseline {baseline}" in compared.stdout.splitlines()[0]
+
+
+def test_a_new_error_against_a_baseline_fails(repo: Repo, short_tmp_path: Path) -> None:
+    baseline = short_tmp_path / "baseline.json"
+    invoke(repo, "--write-baseline", str(baseline), "--", "src")
+    repo.write("src/clean.py", BROKEN_SOURCE)
+    # Lines added above the recorded error: it must still be matched.
+    repo.write("src/legacy.py", "import os\n\n\n" + repo.read("src/legacy.py"))
+
+    result = invoke(repo, "--baseline", str(baseline), "--", "src")
+
+    assert result.exit_code == EXIT_NEW_ERRORS, result.output
+    assert "+ NEW (1)" in result.stdout
+    assert "src/clean.py:6" in result.stdout
+    assert "1 unchanged error" in result.stdout
+
+
+def test_a_baseline_of_a_commit_follows_reworded_errors(repo: Repo, short_tmp_path: Path) -> None:
+    """Recorded from a clean tree, the baseline knows its files: CHANGED works as against -b."""
+    baseline = short_tmp_path / "baseline.json"
+    invoke(repo, "--write-baseline", str(baseline), "--", "src")
+    repo.write("src/legacy.py", 'def broken() -> float:\n    return "already wrong"\n')
+
+    result = invoke(repo, "--baseline", str(baseline), "--", "src")
+
+    assert result.exit_code == EXIT_OK, result.output
+    assert "~ CHANGED (1)" in result.stdout
+
+
+def test_a_baseline_of_uncommitted_changes_says_so(repo: Repo, short_tmp_path: Path) -> None:
+    if repo.vcs == "jj":
+        pytest.skip("jj snapshots the working copy: a baseline of it is a commit")
+    baseline = short_tmp_path / "baseline.json"
+    repo.write("src/extra.py", "x: int = 1\n")
+    invoke(repo, "--write-baseline", str(baseline), "--", "src")
+
+    result = invoke(repo, "--baseline", str(baseline), "--", "src")
+
+    assert result.exit_code == EXIT_OK, result.output
+    assert "recorded from uncommitted changes" in result.stdout.splitlines()[0]
+
+
+def test_a_baseline_from_another_mypy_warns(repo: Repo, short_tmp_path: Path) -> None:
+    baseline = short_tmp_path / "baseline.json"
+    invoke(repo, "--write-baseline", str(baseline), "--", "src")
+    recorded = json.loads(baseline.read_text(encoding="utf-8"))
+    recorded["mypy_version"] = "mypy 0.1"
+    baseline.write_text(json.dumps(recorded), encoding="utf-8")
+
+    result = invoke(repo, "--baseline", str(baseline), "--", "src")
+
+    assert result.exit_code == EXIT_OK, result.output
+    assert "was written with mypy 0.1" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("args", "expected"),
+    [
+        (["--baseline", "b.json", "-b", "main"], "a baseline file takes its place"),
+        (["--write-baseline", "b.json", "--tip"], "a baseline file takes its place"),
+        (["--baseline", "a.json", "--write-baseline", "b.json"], "exclude each other"),
+        (["--baseline", "missing.json"], "No baseline at missing.json"),
+    ],
+)
+def test_baseline_misuse_is_an_error(repo: Repo, args: list[str], expected: str) -> None:
+    result = invoke(repo, *args, "--", "src")
+    assert result.exit_code == EXIT_FAILURE
+    assert expected in result.stderr
+
+
+@pytest.mark.skipif(JJ is None, reason="jj is not installed")
+def test_recording_says_which_of_several_revisions_it_took(
+    jj_repo: Repo, short_tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(jj_repo.root)
+    baseline = str(short_tmp_path / "b.json")
+    result = invoke(jj_repo, "--write-baseline", baseline, "--to", "main | @", "--", "src")
+    assert result.exit_code == EXIT_OK, result.output
+    assert "resolves to 2 revisions" in result.stderr
+
+
+def test_a_baseline_target_that_does_not_exist_is_an_error(
+    repo: Repo, short_tmp_path: Path
+) -> None:
+    result = invoke(repo, "--write-baseline", str(short_tmp_path / "b.json"), "--", "nope")
+    assert result.exit_code == EXIT_FAILURE
+    assert "`nope` does not exist in the working copy" in result.stderr
+
+
+# ------------------------------------------------------------------ --staged
+
+
+def stage(repo: Repo, *paths: str) -> None:
+    assert GIT is not None
+    run([GIT, "add", *paths], cwd=repo.root)
+
+
+def test_staged_checks_the_index_not_the_working_copy(
+    git_repo: Repo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pre-commit hook must judge what is committed, not an unstaged fix next to it."""
+    monkeypatch.chdir(git_repo.root)
+    git_repo.write("src/clean.py", BROKEN_SOURCE)
+    stage(git_repo, "src/clean.py")
+    git_repo.write(
+        "src/clean.py", git_repo.read("src/clean.py").replace("return 42", "return name")
+    )
+
+    result = invoke(git_repo, "--staged", "--", "src")
+
+    assert result.exit_code == EXIT_NEW_ERRORS, result.output
+    assert "+ NEW (1)" in result.stdout
+    header = result.stdout.splitlines()
+    assert "(HEAD: what the commit adds)" in header[0]
+    assert "staged changes" in header[1]
+
+
+def test_staged_passes_an_unstaged_regression(
+    git_repo: Repo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(git_repo.root)
+    git_repo.write("src/legacy.py", "def broken() -> str:\n    return 'now correct'\n")
+    stage(git_repo, "src/legacy.py")
+    git_repo.write("src/clean.py", BROKEN_SOURCE)  # not staged: not part of the commit
+
+    result = invoke(git_repo, "--staged", "--", "src")
+
+    assert result.exit_code == EXIT_OK, result.output
+    assert "- FIXED (1)" in result.stdout
+    assert "NEW" not in result.stdout
+
+
+def test_staged_with_nothing_staged_runs_once(
+    git_repo: Repo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(git_repo.root)
+    git_repo.write("src/clean.py", BROKEN_SOURCE)  # not staged
+
+    result = invoke(git_repo, "--staged", "--", "src")
+
+    assert result.exit_code == EXIT_OK, result.output
+    assert "the same files as the base" in result.stderr
+
+
+def test_doctor_shows_the_staged_comparison(
+    git_repo: Repo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(git_repo.root)
+    result = invoke(git_repo, "--doctor", "--staged")
+    assert "(HEAD: what the commit adds)" in result.stdout
+    assert "staged changes" in result.stdout
+
+
+def test_staged_and_to_exclude_each_other(git_repo: Repo, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(git_repo.root)
+    result = invoke(git_repo, "--staged", "--to", "HEAD", "--", "src")
+    assert result.exit_code == EXIT_FAILURE
+    assert "--staged and --to both choose the target" in result.stderr
+
+
+@pytest.mark.skipif(JJ is None, reason="jj is not installed")
+def test_staged_is_refused_by_jj(jj_repo: Repo, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(jj_repo.root)
+    result = invoke(jj_repo, "--staged", "--", "src")
+    assert result.exit_code == EXIT_FAILURE
+    assert "jj has none" in result.stderr
+
+
+# ------------------------------------------------------------------ --isolated, --prepare
+
+
+def test_isolated_checks_the_working_copy_like_the_base(repo: Repo) -> None:
+    """Checked out, the working copy keeps its changes, untracked files included."""
+    repo.write("src/brand_new.py", BROKEN_SOURCE)
+
+    result = invoke(repo, "--isolated", "--", "src")
+
+    assert result.exit_code == EXIT_NEW_ERRORS, result.output
+    assert "src/brand_new.py:6" in result.stdout
+    assert "checked out on its own" in result.stdout.splitlines()[1]
+
+
+def test_isolated_leaves_ignored_files_out_on_both_sides(
+    git_repo: Repo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The asymmetry the default mode warns about: a file only the working copy has."""
+    monkeypatch.chdir(git_repo.root)
+    (git_repo.root / ".git" / "info" / "exclude").write_text("generated.py\n", encoding="utf-8")
+    git_repo.write("src/generated.py", BROKEN_SOURCE)
+
+    in_place = invoke(git_repo, "--", "src")
+    isolated = invoke(git_repo, "--isolated", "--", "src")
+
+    assert in_place.exit_code == EXIT_NEW_ERRORS, in_place.output
+    assert isolated.exit_code == EXIT_OK, isolated.output
+    assert "generated.py" not in isolated.stdout
+
+
+def write_generator(directory: Path, content: str) -> str:
+    """A --prepare command that writes src/generated.py in the directory it runs in."""
+    script = directory / "generate.py"
+    script.write_text(
+        "from pathlib import Path\n"
+        f"Path('src', 'generated.py').write_text({content!r}, encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    return f'"{sys.executable}" "{script}"'
+
+
+def test_prepare_runs_in_both_checkouts(repo: Repo, short_tmp_path: Path) -> None:
+    """Generated code exists on both sides, so its error is pre-existing, not new."""
+    command = write_generator(short_tmp_path, 'value: int = "generated"\n')
+    repo.write("src/clean.py", repo.read("src/clean.py") + "\n# touched\n")
+
+    result = invoke(repo, "--isolated", "--prepare", command, "--", "src")
+
+    assert result.exit_code == EXIT_OK, result.output
+    assert "2 unchanged errors in 2 files" in result.stdout
+    # The working copy itself is never touched.
+    assert not (repo.root / "src" / "generated.py").exists()
+
+
+def test_a_different_prepare_command_is_not_served_from_the_cache(
+    repo: Repo, short_tmp_path: Path
+) -> None:
+    cache = short_tmp_path / "cache"
+    repo.write("src/clean.py", repo.read("src/clean.py") + "\n# touched\n")
+    (short_tmp_path / "a").mkdir()
+    (short_tmp_path / "b").mkdir()
+    broken = write_generator(short_tmp_path / "a", 'value: int = "generated"\n')
+    fine = write_generator(short_tmp_path / "b", "value: int = 1\n")
+
+    first = invoke(repo, "--isolated", "--prepare", broken, "--", "src", cache=cache)
+    second = invoke(repo, "--isolated", "--prepare", fine, "--", "src", cache=cache)
+
+    assert "2 unchanged errors" in first.stdout, first.output
+    assert "1 unchanged error " in second.stdout, second.output
+
+
+def test_doctor_shows_the_isolated_target_and_the_prepare_command(repo: Repo) -> None:
+    result = invoke(repo, "--doctor", "--isolated", "--prepare", "make proto")
+    assert "checked out on its own" in result.stdout
+    assert "prepare          make proto  (in every checkout, before mypy)" in result.stdout
+
+
+GENERATED_USES_ADD = "from clean import add\n\nvalue: str = add(1, 2)\n"
+ADD_RETURNS_FLOAT = (
+    "def add(a: int, b: int) -> float:\n    return a + b\n\n\n"
+    "def greet(name: str) -> str:\n    return 'hello ' + name\n"
+)
+
+
+def test_prepared_code_is_matched_by_the_text_mypy_read(repo: Repo, short_tmp_path: Path) -> None:
+    """Generated code exists in no commit. Its error, reworded because an imported signature
+    changed, must be CHANGED, not NEW plus FIXED: matching needs the prepared text."""
+    command = write_generator(short_tmp_path, GENERATED_USES_ADD)
+    repo.write("src/clean.py", ADD_RETURNS_FLOAT)
+
+    result = invoke(repo, "--isolated", "--prepare", command, "--", "src")
+
+    assert result.exit_code == EXIT_OK, result.output
+    assert "~ CHANGED (1)" in result.stdout
+    assert "NEW" not in result.stdout
+
+
+def test_a_baseline_keeps_the_text_of_prepared_files(repo: Repo, short_tmp_path: Path) -> None:
+    command = write_generator(short_tmp_path, GENERATED_USES_ADD)
+    baseline = short_tmp_path / "baseline.json"
+    repo.write("src/clean.py", repo.read("src/clean.py") + "\n# touched\n")
+    recorded = invoke(
+        repo, "--isolated", "--prepare", command, "--write-baseline", str(baseline), "--", "src"
+    )
+    assert recorded.exit_code == EXIT_OK, recorded.output
+    assert "src/generated.py" in json.loads(baseline.read_text(encoding="utf-8"))["generated"]
+    repo.write("src/clean.py", ADD_RETURNS_FLOAT)
+
+    result = invoke(
+        repo, "--isolated", "--prepare", command, "--baseline", str(baseline), "--", "src"
+    )
+
+    assert result.exit_code == EXIT_OK, result.output
+    assert "~ CHANGED (1)" in result.stdout
+
+
+def test_prepare_still_runs_when_nothing_changed(repo: Repo) -> None:
+    """A clean working copy is the base's tree, but only the base's checkout is prepared: the
+    one-run shortcut would skip the command, and a failing one would go unnoticed."""
+    command = f'"{sys.executable}" -c "import sys; sys.exit(4)"'
+
+    result = invoke(repo, "--prepare", command, "--", "src")
+
+    assert result.exit_code == EXIT_FAILURE, result.output
+    assert "--prepare failed" in result.stderr
+
+
+def test_a_failing_prepare_command_fails_the_run(repo: Repo) -> None:
+    command = f'"{sys.executable}" -c "import sys; print(\'boom\'); sys.exit(3)"'
+    repo.write("src/clean.py", repo.read("src/clean.py") + "\n# touched\n")
+
+    result = invoke(repo, "--isolated", "--prepare", command, "--", "src")
+
+    assert result.exit_code == EXIT_FAILURE
+    assert "--prepare failed" in result.stderr
+    assert "exit code 3" in result.stderr
+    assert "boom" in result.stderr
+
+
+# ------------------------------------------------------------------ mypy-diff
+
+
+@pytest.mark.parametrize(
+    ("markers", "jj_installed", "expected"),
+    [
+        ([".git"], True, GitBackend),
+        ([".jj", ".git"], True, JjBackend),
+        ([".jj", ".git"], False, GitBackend),
+        ([".jj"], False, JjBackend),
+        ([], True, GitBackend),
+    ],
+)
+def test_mypy_diff_picks_the_backend_of_the_repository(
+    short_tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    markers: list[str],
+    jj_installed: bool,
+    expected: type[object],
+) -> None:
+    for marker in markers:
+        (short_tmp_path / marker).mkdir()
+    nested = short_tmp_path / "src" / "pkg"
+    nested.mkdir(parents=True)
+    monkeypatch.setattr(shutil, "which", lambda name: f"/bin/{name}" if jj_installed else None)
+
+    assert detect_backend(nested) is expected
+
+
+def test_staged_picks_git_in_a_colocated_repository(
+    short_tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only git has an index: `mypy-diff --staged` in a git hook must not pick jj."""
+    (short_tmp_path / ".jj").mkdir()
+    (short_tmp_path / ".git").mkdir()
+    monkeypatch.setattr(shutil, "which", lambda name: f"/bin/{name}")
+
+    assert detect_backend(short_tmp_path) is JjBackend
+    assert detect_backend(short_tmp_path, needs_index=True) is GitBackend
+
+
+def test_the_nearest_repository_wins(short_tmp_path: Path) -> None:
+    """A git repository checked out inside a jj workspace is a git repository."""
+    (short_tmp_path / ".jj").mkdir()
+    inner = short_tmp_path / "vendor" / "lib"
+    (inner / ".git").mkdir(parents=True)
+
+    assert detect_backend(inner) is GitBackend
+
+
+def test_mypy_diff_runs_with_the_detected_backend(
+    git_repo: Repo, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(git_repo.root)
+    monkeypatch.setattr(sys, "argv", ["mypy-diff", "--mypy-cmd", MYPY_CMD, "--doctor"])
+
+    with pytest.raises(SystemExit) as exited:
+        main()
+
+    assert exited.value.code == EXIT_OK
+    assert "git" in capsys.readouterr().out
 
 
 def test_skip_version_check_still_requires_the_tool_to_exist(
